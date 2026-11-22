@@ -1,0 +1,102 @@
+services:
+  catalogo-db:
+    image: mongo:7
+    container_name: catalogo-db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:?falta en .env}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:?falta en .env}
+    volumes:
+      - catalogo-db-data:/data/db
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mongosh --quiet --eval "db.adminCommand('ping').ok" || exit 1
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - catalogo-net
+    # Sin bloque ports: la base de datos NUNCA se publica al host
+    # Solo se accede desde la red catalogo-net
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_OVERRIDE
+      - CHOWN
+      - SETGID
+      - SETUID
+
+  catalogo-api:
+    build:
+      context: ./backend
+      args:
+        APP_VERSION: ${APP_VERSION:-v1}
+    image: catalogo-api:v1
+    container_name: catalogo-api
+    # Solo se publica al host para depuracion con curl durante la demo, antes de que exista el frontend
+    # En produccion no se publica al host, y se accede desde la red catalogo-net desde catalogo-frontend
+    # En K8s sera Service interno
+    ports:
+      - "8000:8000"
+    environment:
+      DB_HOST: ${DB_HOST:-catalogo-db}
+      DB_PORT: ${DB_PORT:-27017}
+      DB_NAME: ${DB_NAME:-catalogodb}
+      DB_USER: ${DB_USER:?falta en .env}
+      DB_PASSWORD: ${DB_PASSWORD:?falta en .env}
+      APP_VERSION: ${APP_VERSION:-v1}
+      ROOT_PATH: ${ROOT_PATH:-/api}
+      SEED_DEMO: ${SEED_DEMO:-true} # Activa la siembra idempotente (upsert por sku) al arrancar
+    depends_on:
+      catalogo-db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    networks:
+      - catalogo-net
+    cap_drop:
+      - ALL
+
+  catalogo-frontend:
+    build:
+      context: ./frontend
+    image: catalogo-frontend:v1
+    container_name: catalogo-frontend
+    ports:
+      - "3000:8080"
+    environment:
+      API_HOST: ${API_HOST:-catalogo-api}
+      API_PORT: ${API_PORT:-8000}
+      NGINX_ENVSUBST_FILTER: ${NGINX_ENVSUBST_FILTER:-^API_}
+    depends_on:
+      catalogo-api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - catalogo-net
+    cap_drop:
+      - ALL
+
+networks:
+  catalogo-net:
+    name: catalogo-net
+
+volumes:
+  catalogo-db-data:
+    name: catalogo-db-data
