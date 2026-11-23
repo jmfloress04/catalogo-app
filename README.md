@@ -818,3 +818,176 @@ Los diez comandos de `kubectl` efectivamente utilizados durante esta entrega:
 | **Seguridad (`cap_drop`)** | `cap_drop: [ALL]` + 4 `cap_add` mínimas en `mongo:7` | Sin restricciones de capabilities declaradas todavía | **Falta configurar `securityContext`**. |
 
 **Conclusión:** Esta entrega conserva intactas las imágenes y el contrato de variables de entorno de la Semana 4, pero expone de forma deliberada todo lo que falta al migrar únicamente a Pods sueltos: nombres DNS estables (`Service`), autorreparación a nivel de Pod (`Deployment`/`StatefulSet`), sondas de salud (`probes`), configuración desacoplada (`ConfigMap`/`Secret`), persistencia (`PV`/`PVC`) y exposición externa (`Ingress`), recursos que se incorporarán progresivamente en las semanas 6 a 8.
+
+## Etapa 6 — Deployments, Services, Rolling Updates y Réplicas sin Estado
+
+### Orden de aplicación (Services antes que Deployments)
+
+Al aplicar `k8s/deploy-catalogo-frontend.yaml` antes de que existiera el Service `catalogo-api`, las dos réplicas del frontend fallaron al arrancar (`0/1 Error` / `CrashLoopBackOff`, con `3` reinicios en 80s):
+
+```text
+NAME                                 READY   STATUS   RESTARTS      AGE
+catalogo-frontend-7c89f9b558-8n4mz   0/1     Error    3 (59s ago)   80s
+catalogo-frontend-7c89f9b558-dp86h   0/1     Error    3 (62s ago)   80s
+```
+
+Error registrado en los logs de Nginx (`kubectl logs -n catalogo-app -l app=catalogo-frontend --tail=10`):
+
+```text
+nginx: [emerg] host not found in upstream "catalogo-api" in /etc/nginx/conf.d/default.conf:24
+```
+
+**Conclusión:**
+- En Kubernetes **no existe `depends_on`** como en Docker Compose.
+- Nginx resuelve el nombre del `upstream` (`catalogo-api`) en el momento del arranque; si ese nombre no existe en **CoreDNS**, el proceso termina con error.
+- El registro DNS de un `Service` existe desde el instante en que se crea el objeto, **aun sin Pods detrás** (no hace falta esperar a que la API esté sana).
+- **Regla operativa:** aplicar siempre primero los `Services` (`svc-catalogo-db`, `svc-catalogo-api`, `svc-catalogo-frontend`) y después los `Deployments` (`deploy-catalogo-db`, `deploy-catalogo-api`, `deploy-catalogo-frontend`).
+
+### Verificación de selectors mediante Endpoints
+
+Salida registrada con `kubectl get endpoints -n catalogo-app`:
+
+```text
+Warning: v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice
+NAME                ENDPOINTS                           AGE
+catalogo-api        10.244.0.33:8000,10.244.0.34:8000   3m52s
+catalogo-db         10.244.0.32:27017                   4m7s
+catalogo-frontend   10.244.0.35:8080,10.244.0.36:8080   3m45s
+```
+
+Verificación cruzada con `kubectl get endpointslices -n catalogo-app` y `kubectl get pods -n catalogo-app -o wide`:
+- **`catalogo-db`** (`ClusterIP :27017`): vinculado a **1 Pod** (`10.244.0.32` → `catalogo-db-654f9f8fdc-pf548`).
+- **`catalogo-api`** (`ClusterIP :8000`): vinculado a **2 Pods** (`10.244.0.33` y `10.244.0.34`).
+- **`catalogo-frontend`** (`NodePort 30302 → 8080`): vinculado a **2 Pods** (`10.244.0.35` y `10.244.0.36`).
+
+**Observaciones:**
+- Ningún Service muestra `<none>`, lo que confirma que el `spec.selector` de cada Service coincide exactamente con las `labels` (`app: ...`) de los Pods creados por su Deployment (un error en el selector se crearía sin fallar, pero dejaría `<none>` en `ENDPOINTS`).
+- El aviso `Warning: v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice` es esperado en el clúster (`v1.37.1`), ya que Kubernetes reemplazó el recurso clásico `Endpoints` por `EndpointSlice`.
+
+### Comprobación de autorreparación
+
+#### Service NodePort de depuración para la API (`catalogo-api-nodeport`)
+
+Se aplicó `k8s/svc-catalogo-api-nodeport.yaml` (`NodePort 30502 → 8000`) seleccionando los mismos Pods (`app: catalogo-api`) que el Service interno `ClusterIP`:
+
+```text
+NAME                            TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)          AGE
+service/catalogo-api            ClusterIP   10.97.194.160    <none>        8000/TCP         25m
+service/catalogo-api-nodeport   NodePort    10.107.115.69    <none>        8000:30502/TCP   9s
+service/catalogo-db             ClusterIP   10.104.156.166   <none>        27017/TCP        25m
+service/catalogo-frontend       NodePort    10.105.47.169    <none>        8080:30302/TCP   25m
+```
+
+Verificación con `curl -s http://172.16.21.16:30502/health`:
+
+```json
+{"status":"ok","db":"ok","version":"v1"}
+```
+
+> **Nota importante:** El objeto `catalogo-api-nodeport` (`k8s/svc-catalogo-api-nodeport.yaml`) **no formará parte del chart de Helm de la Etapa 8**; existe únicamente con fines de depuración. En arquitectura normal, la API solo se expone internamente mediante `ClusterIP`.
+
+#### Pod suelto vs. Deployment → ReplicaSet
+
+Con la aplicación abierta en el navegador, se eliminó manualmente una de las dos réplicas de la API (`catalogo-api-7d4455d6dd-2q6ng`):
+
+```text
+# Antes:
+catalogo-api-7d4455d6dd-2q6ng   1/1     Running   0          35m
+catalogo-api-7d4455d6dd-cd886   1/1     Running   0          35m
+
+# Tras ejecutar: kubectl delete pod catalogo-api-7d4455d6dd-2q6ng -n catalogo-app
+catalogo-api-7d4455d6dd-cd886   1/1     Running   0          36m
+catalogo-api-7d4455d6dd-qdgbp   1/1     Running   0          13s
+```
+
+**Observaciones y contraste con Pod suelto:**
+- En segundos, el `ReplicaSet` (`catalogo-api-7d4455d6dd`) detectó que había `1` réplica en lugar de las `2` deseadas y creó automáticamente un Pod nuevo (`catalogo-api-7d4455d6dd-qdgbp`, mismo hash de ReplicaSet pero nuevo sufijo y nueva IP).
+- La aplicación **no dejó de responder** en ningún momento porque la segunda réplica (`...-cd886`) siguió atendiendo tráfico y el Service actualizó sus `Endpoints` de forma transparente.
+- **Contraste:** con Pods sueltos, eliminar `catalogo-api` lo borraba definitivamente y nadie lo recreaba; ahora el `Deployment` + `ReplicaSet` garantizan la autorreparación continua.
+
+### Actualización progresiva (`RollingUpdate`) y `rollback`
+
+1. **Construcción y publicación de `v2` en Docker Hub:**
+   Se construyó y publicó `jmfloress04/catalogo-api:v2` con `--build-arg APP_VERSION=v2` (`digest: sha256:af602965b7e853eaab2479f63a96f1a95010f7794f4c3f15b60110b7966feaa2`), ya que el clúster solo descarga imágenes desde el registry.
+
+2. **Actualización progresiva (`v1 → v2`):**
+   Al ejecutar `kubectl set image deployment/catalogo-api catalogo-api=jmfloress04/catalogo-api:v2 -n catalogo-app`, el rollout completó sin cortes (`deployment "catalogo-api" successfully rolled out`).
+   - En `kubectl get rs -n catalogo-app -l app=catalogo-api` se comprobó que el `ReplicaSet` anterior quedó conservado en `0` réplicas:
+     ```text
+     NAME                      DESIRED   CURRENT   READY   AGE
+     catalogo-api-7d4455d6dd   0         0         0       59m
+     catalogo-api-86bd6d7c     2         2         2       58s
+     ```
+   - `curl -s http://172.16.21.16:30502/health` (y el indicador de versión del frontend) pasaron de `v1` a **`v2`**:
+     ```json
+     {"status":"ok","db":"ok","version":"v2"}
+     ```
+
+3. **Reversión (`rollback` `v2 → v1`):**
+   Al ejecutar `kubectl rollout undo deployment/catalogo-api -n catalogo-app`, Kubernetes escaló nuevamente el `ReplicaSet` de `v1` y bajó a `0` el de `v2`, devolviendo la API y el frontend a **`v1`** (`{"status":"ok","db":"ok","version":"v1"}`).
+
+4. **Historial de revisiones (`kubectl rollout history`):**
+   ```text
+   # Tras actualizar a v2:        # Tras ejecutar rollout undo:
+   REVISION  CHANGE-CAUSE         REVISION  CHANGE-CAUSE
+   1         <none>               2         <none>
+   2         <none>               3         <none>
+   ```
+   - La columna `CHANGE-CAUSE` en `<none>` es el comportamiento esperado por defecto.
+   - Al hacer `rollback`, el historial **no retrocede sino que avanza**: `v1` se reutiliza y pasa a registrarse como **revisión 3** (y si una imagen `v2` no estuviera publicada en Docker Hub, el Pod nuevo quedaría en `ImagePullBackOff` mientras los Pods de `v1` siguen atendiendo sin interrupción hasta corregir o ejecutar `rollout undo`).
+
+### Escalado a 3 réplicas y por qué la API debe ser sin estado (*stateless*)
+
+1. **Escalado de la API y verificación de respuestas:**
+   Se escaló `catalogo-api` a 3 réplicas (`kubectl scale deployment catalogo-api --replicas=3 -n catalogo-app`), todas en `1/1 Running`:
+   ```text
+   NAME                            READY   STATUS    RESTARTS   AGE
+   catalogo-api-7d4455d6dd-5h8pj   1/1     Running   0          37s
+   catalogo-api-7d4455d6dd-cl5rq   1/1     Running   0          10m
+   catalogo-api-7d4455d6dd-glc9j   1/1     Running   0          10m
+   ```
+   Se realizaron 10 solicitudes consecutivas contra `http://172.16.21.16:30502/productos` respondiendo todas `200 OK`:
+   ```text
+   200 200 200 200 200 200 200 200 200 200
+   ```
+
+2. **Experimento de archivo en disco local entre réplicas:**
+   - Escritura en la réplica `catalogo-api-7d4455d6dd-glc9j`:
+     ```text
+     catalogo-api-7d4455d6dd-glc9j
+     -rw-r--r-- 1 appuser appuser 7 Nov 23 15:07 /tmp/foto.bin
+     ```
+   - Lectura desde otra réplica (`catalogo-api-7d4455d6dd-cl5rq`):
+     ```text
+     ls: cannot access '/tmp/foto.bin': No such file or directory
+     command terminated with exit code 2
+     ```
+
+3. **Conclusión (Variante C — API sin estado):**
+   - Cada Pod posee su propio sistema de archivos efímero y aislado. Un archivo escrito en el disco de un Pod **no es visible desde ninguna otra réplica** y **desaparece definitivamente cuando el Pod se recrea**.
+   - Si `catalogo-api` guardara las imágenes de productos en su disco local con 3 réplicas detrás del Service, las peticiones que cayeran en cualquiera de las otras dos réplicas fallarían al servir esa imagen (y tras un rolling update o autorreparación se perderían todas).
+   - Por esa razón, **`catalogo-app` almacena los bytes de cada imagen dentro del documento de MongoDB**, manteniendo la API completamente **sin estado (*stateless*)** y logrando que todas sus réplicas sean intercambiables.
+
+### Limitación conocida: `catalogo-db` sin persistencia
+
+Se verificó experimentalmente que `catalogo-db` corre actualmente como un `Deployment` de `1` réplica **sin volumen persistente**:
+
+1. **Antes de eliminar el Pod de MongoDB:**
+   ```bash
+   curl -s http://172.16.21.16:30502/productos | grep -o '"sku"' | wc -l
+   ```
+    → **`13`** productos (`12` demo + `1` cargado a mano con imagen).
+
+2. **Eliminación y recreación automática de la base de datos:**
+   ```bash
+   kubectl delete pod -l app=catalogo-db -n catalogo-app
+   ```
+   el Pod `catalogo-db-654f9f8fdc-pf548` fue reemplazado automáticamente por `catalogo-db-654f9f8fdc-bz8lb` con `/data/db` vacío.
+   Al consultar nuevamente `/productos` sin reiniciar la API → **`[]`** (**catálogo vacío**).
+
+3. **Reinicio progresivo de la API (`kubectl rollout restart deployment/catalogo-api -n catalogo-app`):**
+   Al volver a consultar `/productos` → **`12`** productos. Reapareció únicamente el catálogo de demostración (porque `SEED_DEMO=true` ejecuta la siembra idempotente al arrancar FastAPI), pero **los productos cargados a mano se perdieron definitivamente**.
+
+**Limitación declarada y arquitectura:**
+- **Persistencia pendiente (Etapa 7):** Esta limitación es conocida y explícita en la etapa 6 y se resolverá en la **Etapa 7** adjuntando un volumen persistente (**`PersistentVolumeClaim` / `PVC`**) a `/data/db`.
+- **No escalar la base de datos:** `catalogo-db` permanece estrictamente en **`replicas: 1`**. Escalarlo (`--replicas=3`) sería aceptado sin error por Kubernetes, pero levantaría tres instancias independientes de MongoDB sin *replica set* detrás del mismo Service, devolviendo catálogos inconsistentes en cada solicitud.
