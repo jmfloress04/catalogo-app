@@ -1,4 +1,4 @@
-## Arquitectura
+## Etapa 1 — Arquitectura
 
     navegador ──► catalogo-frontend ──────► catalogo-api ──────► catalogo-db
                   React + Vite              Python + FastAPI      MongoDB 7
@@ -15,7 +15,7 @@
 El frontend es el único punto de entrada: nadie le habla a la base
 directamente, y a la API le habla el frontend.
 
-## Medición y Optimización de Imágenes
+## Etapa 2 — Medición y Optimización de Imágenes
 
 | Imagen | Tag | Imagen Base Final | Tamaño en disco | Tamaño comprimido | Reducción |
 | :--- | :--- | :--- | :---: | :---: | :---: |
@@ -130,7 +130,7 @@ git restore backend/main.py backend/requirements.txt
 docker rmi catalogo-api:cache-test
 ```
 
-## Redes y Almacenamiento
+## Etapa 3 — Redes y Almacenamiento
 
 ### Red y volumen
 
@@ -366,7 +366,7 @@ Para levantar `catalogo-app` con `docker run` debe respetarse estrictamente este
 **Limitación actual (resuelta en la Semana 4):**
 Todo este orden de arranque, las variables de entorno, la red y el volumen residen hoy únicamente en la memoria del operador (o como comandos sueltos en este `README.md`) y no en ningún archivo ejecutable. En la Semana 4, **Docker Compose** (`docker-compose.yml`) reemplaza esta secuencia manual por una definición declarativa reproducible con un solo comando.
 
-## Docker Compose y Seguridad Básica
+## Etapa 4 — Docker Compose y Seguridad Básica
 
 ### Healthcheck de `catalogo-db` (MongoDB 7)
 
@@ -553,3 +553,243 @@ Se aplicó `cap_drop: [ALL]` a los tres servicios en `docker-compose.yml`. Las d
 
 - **Qué desapareció:** los comandos largos y repetitivos en memoria, las esperas manuales mirando logs, el riesgo de romper el orden de arranque y las contraseñas hardcodeadas en los comandos.
 - **Qué apareció:** infraestructura declarativa versionada, validación previa (`config`), chequeos automáticos de salud (`healthcheck`), arranque encadenado (`service_healthy`), contrato de variables (`.env` / `.env.example`) y mínimo privilegio (`cap_drop` / `cap_add`).
+
+## Etapa 5 — Primer despliegue en Kubernetes (Pods sueltos)
+
+### Contexto del clúster (verificación previa)
+
+```bash
+$ kubectl config current-context
+jflores
+
+$ kubectl cluster-info
+Kubernetes control plane is running at https://172.16.21.16:6443
+CoreDNS is running at https://172.16.21.16:6443/api/v1/namespaces/kube-system/services/kube-dns:dns/proxy
+
+$ kubectl get nodes -o wide
+NAME      STATUS   ROLES           AGE   VERSION   INTERNAL-IP    EXTERNAL-IP   OS-IMAGE                       KERNEL-VERSION                       CONTAINER-RUNTIME
+jflores   Ready    control-plane   40d   v1.37.1   172.16.21.16   <none>        Debian GNU/Linux 13 (trixie)   6.12.116+deb13-cloud-amd64 (amd64)   containerd://1.7.24
+```
+
+### 1. Prueba de `ImagePullBackOff`
+
+Prueba deliberada omitiendo el usuario del registry (`catalogo-api:v1` en lugar de `jmfloress04/catalogo-api:v1`):
+
+```bash
+$ kubectl run prueba-imagepull --image=catalogo-api:v1
+pod/prueba-imagepull created
+
+$ kubectl get pods
+NAME               READY   STATUS         RESTARTS   AGE
+prueba-imagepull   0/1     ErrImagePull   0          39s
+
+$ kubectl describe pod prueba-imagepull
+...
+Events:
+  Type     Reason     Age                From               Message
+  ----     ------     ----               ----               -------
+  Normal   Scheduled  65s                default-scheduler  Successfully assigned default/prueba-imagepull to jflores
+  Normal   BackOff    28s (x2 over 58s)  kubelet            spec.containers{prueba-imagepull}: Back-off pulling image "catalogo-api:v1"
+  Warning  Failed     28s (x2 over 58s)  kubelet            spec.containers{prueba-imagepull}: Error: ImagePullBackOff
+  Normal   Pulling    14s (x3 over 60s)  kubelet            spec.containers{prueba-imagepull}: Pulling image "catalogo-api:v1"
+  Warning  Failed     13s (x3 over 58s)  kubelet            Failed to pull image "catalogo-api:v1": failed to pull and unpack image "docker.io/library/catalogo-api:v1": failed to resolve reference "docker.io/library/catalogo-api:v1": pull access denied, repository does not exist or may require authorization
+  Warning  Failed     13s (x3 over 58s)  kubelet            Error: ErrImagePull
+
+$ kubectl logs prueba-imagepull
+Error from server (BadRequest): container "prueba-imagepull" in pod "prueba-imagepull" is waiting to start: trying and failing to pull image
+
+$ kubectl delete pod prueba-imagepull
+pod "prueba-imagepull" deleted from default namespace
+```
+
+- **Imagen que intentó descargar el `kubelet`:** `docker.io/library/catalogo-api:v1` (el espacio oficial de Docker Hub, al omitir el usuario `jmfloress04/`).
+- **Por qué `kubectl logs` no devuelve nada:** porque el contenedor nunca llegó a crearse ni arrancar; en `ImagePullBackOff` la causa siempre está en los `Events` de `kubectl describe`.
+
+### 2. Creación del namespace `catalogo-app` y configuración del contexto
+
+```bash
+$ kubectl config current-context
+jflores
+
+$ kubectl create namespace catalogo-app
+namespace/catalogo-app created
+
+$ kubectl config set-context --current --namespace=catalogo-app
+Context "jflores" modified.
+
+$ kubectl get namespaces
+NAME                 STATUS   AGE
+catalogo-app         Active   3m12s
+default              Active   40d
+kube-flannel         Active   40d
+kube-node-lease      Active   40d
+kube-public          Active   40d
+kube-system          Active   40d
+local-path-storage   Active   29d
+metallb-system       Active   40d
+nginx-ingress        Active   40d
+
+$ kubectl config view --minify | grep namespace:
+    namespace: catalogo-app
+```
+
+Verificar primero `kubectl config current-context` confirma que estamos operando sobre el clúster correcto (`jflores`) antes de aplicar cambios. Al crear el namespace `catalogo-app` y fijarlo como namespace por defecto del contexto, todos los comandos posteriores de `kubectl` apuntan automáticamente a `catalogo-app` en lugar de `default`, evitando crear o buscar Pods en el namespace equivocado.
+
+### 3. Generación del primer manifiesto (`k8s/pod-catalogo-db.yaml`) con `--dry-run=client`
+
+```bash
+$ mkdir -p k8s
+$ kubectl run catalogo-db --image=mongo:7 --dry-run=client -o yaml > k8s/pod-catalogo-db.yaml
+$ cat k8s/pod-catalogo-db.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    run: catalogo-db
+  name: catalogo-db
+spec:
+  containers:
+  - image: mongo:7
+    name: catalogo-db
+    resources: {}
+  dnsPolicy: ClusterFirst
+  restartPolicy: Always
+status: {}
+```
+
+Luego se editó `k8s/pod-catalogo-db.yaml` limpiando los campos vacíos (`resources: {}` y `status: {}`) e incorporando el namespace `catalogo-app`, el puerto `27017` y las variables `MONGO_INITDB_ROOT_USERNAME` y `MONGO_INITDB_ROOT_PASSWORD`.
+
+**Conclusión:** Generar el esqueleto YAML con `--dry-run=client -o yaml` y luego editarlo evita memorizar toda la estructura y reduce errores de sintaxis; además no aplica nada todavía contra el clúster, permitiendo revisar y versionar el manifiesto antes de desplegarlo.
+
+### 4. Despliegue de las tres capas como Pods sueltos y registro de IPs
+
+Se crearon `k8s/pod-catalogo-api.yaml` (incluyendo `ROOT_PATH=/api`) y `k8s/pod-catalogo-frontend.yaml` con las variables de la semana 3, y se aplicaron los tres manifiestos en orden (`db` → `api` → `frontend`):
+
+```bash
+$ kubectl apply -f k8s/pod-catalogo-db.yaml
+pod/catalogo-db created
+
+$ kubectl apply -f k8s/pod-catalogo-api.yaml
+pod/catalogo-api created
+
+$ kubectl apply -f k8s/pod-catalogo-frontend.yaml
+pod/catalogo-frontend created
+
+$ kubectl get pods -w
+NAME                READY   STATUS              RESTARTS      AGE
+catalogo-api        0/1     ContainerCreating   0             26s
+catalogo-db         1/1     Running             0             97s
+catalogo-frontend   0/1     ContainerCreating   0             8s
+catalogo-api        1/1     Running             0             68s
+catalogo-frontend   1/1     Running             0             63s
+catalogo-frontend   0/1     Error               0             71s
+catalogo-frontend   0/1     CrashLoopBackOff    1 (15s ago)   87s
+catalogo-api        0/1     Error               0             2m7s
+catalogo-api        1/1     Running             1 (2s ago)    2m8s
+catalogo-api        0/1     Error               1 (61s ago)   3m7s
+catalogo-api        0/1     CrashLoopBackOff    1 (11s ago)   3m17s
+catalogo-api        1/1     Running             2 (12s ago)   3m18s
+
+$ kubectl get pods -o wide
+NAME                READY   STATUS    RESTARTS      AGE     IP            NODE      NOMINATED NODE   READINESS GATES
+catalogo-api        1/1     Running   2 (21s ago)   3m27s   10.244.0.25   jflores   <none>           <none>
+catalogo-db         1/1     Running   0             4m38s   10.244.0.24   jflores   <none>           <none>
+catalogo-frontend   0/1     Error     4 (75s ago)   3m9s    10.244.0.26   jflores   <none>           <none>
+```
+
+**Direcciones IP asignadas a cada Pod:**
+
+| Pod | IP asignada | Nodo | Estado observado |
+| :--- | :---: | :---: | :--- |
+| `catalogo-db` | `10.244.0.24` | `jflores` | `1/1 Running` (`0` reinicios) |
+| `catalogo-api` | `10.244.0.25` | `jflores` | `Error` / `CrashLoopBackOff` (`2` reinicios; reintenta ~60 s antes de fallar) |
+| `catalogo-frontend` | `10.244.0.26` | `jflores` | `Error` / `CrashLoopBackOff` (`4` reinicios; falla al instante) |
+
+**Conclusión:** Aunque los tres Pods están desplegados en el mismo namespace (`catalogo-app`) y en el mismo nodo (`jflores`), solo `catalogo-db` se mantiene estable porque no depende de resolver ningún otro nombre. Tanto `catalogo-api` (que busca `catalogo-db`) como `catalogo-frontend` (que busca `catalogo-api`) entran en `CrashLoopBackOff` porque en Kubernetes un Pod suelto no registra ningún nombre DNS; además, a diferencia de Compose, en Kubernetes no existe `depends_on` y `Running` no equivale a `Ready` sin una `readinessProbe` (y en MongoDB el proceso puede aceptar conexiones TCP incluso antes de terminar de crear el usuario administrador, por lo que `depends_on` + `condition: service_healthy` se reemplaza con *probes* y reintentos en la aplicación).
+
+### 5. Diagnóstico del `CrashLoopBackOff` de `catalogo-api`
+
+```bash
+$ kubectl describe pod catalogo-api
+$ kubectl logs catalogo-api --previous
+```
+
+*Nota: al consultar `kubectl logs catalogo-api --previous` mientras el contenedor actual ya estaba en `Terminated` esperando backoff, `containerd` devolvió `unable to retrieve container logs` sobre la instancia más antigua; los logs del fallo completo se obtuvieron directamente con `kubectl logs catalogo-api`.*
+
+**Conclusión:** El error informado por `pymongo` es **`ServerSelectionTimeoutError`** (`[Errno -2] Name or service not known`) y **NO** `Authentication failed`. Esto ocurre porque `DB_HOST=catalogo-db` ni siquiera pudo resolverse en DNS: en Kubernetes un Pod suelto no provee un nombre resoluble a ningún otro Pod (esa es la función de un **`Service`**, que todavía no existe). Al fallar en la resolución de nombres antes de abrir la conexión TCP, la API nunca alcanzó a MongoDB y por eso jamás llegó a la instancia de autenticación donde aparecería `Authentication failed`.
+
+### 6. Conexión temporal por IP y por qué la IP de un Pod es descartable 
+
+Al reemplazar temporalmente `DB_HOST` en `k8s/pod-catalogo-api.yaml` por la dirección IP original del Pod de MongoDB (`10.244.0.24`) y recrear `catalogo-api`, la API logró conectarse a la base de datos y alcanzó el estado `1/1 Running` sin reinicios.
+
+A continuación se eliminó el Pod `catalogo-db` y se volvió a crear con el mismo manifiesto `k8s/pod-catalogo-db.yaml`. Kubernetes le asignó una dirección IP diferente (`<IP_NUEVA>` en lugar de `10.244.0.24`), provocando que `catalogo-api` volviera a fallar al seguir apuntando a una dirección inexistente.
+
+**Conclusión:** La dirección IP de un Pod es efímera y descartable: cada vez que un Pod se elimina, se reprograma o se recrea, recibe una IP nueva del clúster, por lo que nunca sirve como punto de configuración. En ese hecho reside la razón de existir de los **`Services`** (Semana 6), que proveen una IP virtual estable y un nombre DNS fijo (`catalogo-db`) por delante de Pods cuyas IPs cambian constantemente.
+
+*Nota de estado final: tras completar las pruebas de la Consigna 8, se restituyó `DB_HOST: "catalogo-db"` en `k8s/pod-catalogo-api.yaml`; el manifiesto queda deliberadamente roto hasta que se cree el `Service` correspondiente en la siguiente entrega.*
+
+### 7. Tercer `host not found in upstream` en `catalogo-frontend`
+
+Al desplegar `k8s/pod-catalogo-frontend.yaml`, Nginx vuelve a fallar al arrancar con el mensaje `host not found in upstream "catalogo-api:8000"`, por tercera vez a lo largo del curso:
+
+| Etapa | Mensaje de error en Nginx | Causa raíz | Cómo se resuelve |
+| :---: | :--- | :--- | :--- |
+| **Semana 3** (`docker run`) | `host not found in upstream "catalogo-api:8000"` | **Faltaba la red custom** (`catalogo-net`) con DNS interno embebido, o la API aún no había sido creada. | Crear la red `bridge` custom `catalogo-net` y levantar `catalogo-api` antes del frontend. |
+| **Semana 4** (`docker compose`) | `host not found in upstream "catalogo-api:8000"` | **Condición de carrera al arrancar:** sin `depends_on`, Compose iniciaba Nginx antes de que existiera `catalogo-api`. | Declarar `depends_on` (con `condition: service_healthy`) en `docker-compose.yml`. |
+| **Semana 5** (Kubernetes — Pods sueltos) | `host not found in upstream "catalogo-api:8000"` | **Falta el `Service`:** aunque `catalogo-api` exista y esté corriendo, un Pod suelto no registra ningún nombre DNS en CoreDNS. | Crear un objeto **`Service`** llamado `catalogo-api` (Semana 6). |
+
+**Conclusión:** Aunque el mensaje de error de Nginx es idéntico al de la tercera semana, la causa arquitectónica es distinta: entonces faltaba la red de Docker con DNS interno, mientras que en Kubernetes falta el **`Service`** que exponga el nombre `catalogo-api` dentro de CoreDNS.
+
+### 8. Acceso temporal sin `Service` mediante `kubectl port-forward`
+
+Con `catalogo-api` en `Running` (apuntando momentáneamente a la IP actual de `catalogo-db`), se abrió un túnel local con `kubectl port-forward pod/catalogo-api 8000:8000` y se probaron los endpoints:
+
+```bash
+$ curl -s localhost:8000/health
+{"status":"ok","db":"ok","version":"v1"}
+
+$ curl -s localhost:8000/productos | head -c 250
+[{"sku":999666,"categoria":"Apple","creado_en":"2026-11-23T06:09:47.862000","descripcion":"Clásico de 4.7\" con Touch ID y cuerpo de aluminio.","imagen_hash":"7e23251b780a76a1","imagen_tipo":"image/jpeg","nombre":"Apple iPhone 6 (Gold, 32 GB)"...
+```
+
+Al acceder a `http://localhost:8000/docs`, Swagger UI devuelve el HTML inicial (`200 OK`) pero **no logra cargar la definición de la API** porque intenta descargar `/api/openapi.json` y recibe **`404 Not Found`**.
+
+**Conclusión:** El `404` en `/docs` (`/api/openapi.json`) **no es un error**, sino la consecuencia directa de haber configurado `ROOT_PATH=/api` desde la Semana 3 para funcionar detrás del proxy reverso Nginx: al entrar directo al Pod por `port-forward` no existe ningún proxy delante que maneje el prefijo `/api`. Además, **`kubectl port-forward` es únicamente una herramienta de depuración temporal y no un mecanismo de publicación**: escucha solo en `127.0.0.1` local, termina al cerrar la terminal y se interrumpe si el Pod se reinicia porque apunta a un Pod concreto y no a un `Service`.
+
+### 9. Mortalidad de los Pods sueltos
+
+Al eliminar el Pod `catalogo-api` y volver a listar los Pods del namespace `catalogo-app`, se comprobó que `catalogo-api` desapareció y Kubernetes no creó ningún reemplazo.
+
+**Conclusión:** En Kubernetes existe autorreparación a nivel de **contenedor** (el `kubelet` reinicia un proceso caído gracias a `restartPolicy: Always`), pero **un Pod suelto es mortal y nadie lo vigila**: si se elimina el Pod entero o cae el nodo donde corría, desaparece y no vuelve. Para garantizar una cantidad deseada de réplicas y autorreparación a nivel de Pod se requieren controladores como **`ReplicaSet` y `Deployment`**.
+
+### 10. Cheatsheet propio de `kubectl` (Consigna 10)
+
+Los diez comandos de `kubectl` efectivamente utilizados durante esta entrega:
+
+| # | Comando | Qué hace |
+| :---: | :--- | :--- |
+| 1 | `kubectl config current-context` | Muestra sobre qué clúster/contexto estoy operando antes de aplicar cambios. |
+| 2 | `kubectl create namespace catalogo-app` | Crea el espacio de nombres lógico `catalogo-app` dentro del clúster. |
+| 3 | `kubectl config set-context --current --namespace=catalogo-app` | Configura `catalogo-app` como namespace por defecto del contexto activo para no repetir `-n`. |
+| 4 | `kubectl run catalogo-db --image=mongo:7 --dry-run=client -o yaml > k8s/pod-catalogo-db.yaml` | Genera el manifiesto YAML base de un Pod localmente sin crearlo todavía en el clúster. |
+| 5 | `kubectl apply -f k8s/pod-catalogo-db.yaml` | Aplica un manifiesto de forma declarativa e idempotente contra la API de Kubernetes. |
+| 6 | `kubectl get pods -o wide` | Lista los Pods del namespace activo mostrando estado, reinicios, dirección IP y nodo asignado. |
+| 7 | `kubectl get pods -w` | Observa en tiempo real las transiciones de estado de los Pods (`ContainerCreating`, `Running`, `Error`, `CrashLoopBackOff`). |
+| 8 | `kubectl describe pod catalogo-api` | Muestra el detalle completo de un Pod y su sección `Events` (fundamental para diagnosticar `ImagePullBackOff` o reinicios). |
+| 9 | `kubectl logs catalogo-api` *(y `--previous`)* | Muestra la salida estándar de la aplicación dentro del Pod (con `--previous` consulta la encarnación anterior tras un reinicio). |
+| 10 | `kubectl port-forward pod/catalogo-api 8000:8000` | Abre un túnel temporal local hacia un puerto de un Pod específico únicamente para depuración. |
+
+### 11. Comparación: `docker-compose.yml` vs. manifiestos `k8s/`
+
+| Aspecto | `docker-compose.yml` (Semana 4) | Manifiestos `k8s/pod-*.yaml` (Semana 5) | Qué ocurrió |
+| :--- | :--- | :--- | :--- |
+| **Imágenes OCI** | `build:` local + `image:` en caché del Docker Engine | `image: jmfloress04/catalogo-*:v1` descargadas desde Docker Hub | **Se conservó** la misma imagen sin cambios; cambió la distribución vía registry. |
+| **Variables de entorno** | Bloque `environment:` con interpolación desde `.env` | Lista `env:` (`name`/`value` como strings) dentro de cada manifiesto | **Se conservó** el contrato (`DB_*`, `ROOT_PATH=/api`, `API_*`), pero los secretos volvieron inline (**faltan `ConfigMap` y `Secret`**). |
+| **Red y resolución DNS** | Red custom `catalogo-net` con DNS interno automático por nombre | Pods sueltos con IP efímera y **sin** registro DNS en CoreDNS | **Desapareció** la resolución por nombre (**falta `Service`**). |
+| **Orden de arranque y salud** | `depends_on` (`condition: service_healthy`) + `healthcheck` | **No existe `depends_on`**; `Running` no equivale a `Ready` | **Desapareció** `depends_on` (**faltan `readinessProbe` / `livenessProbe`** + reintentos en la app). |
+| **Exposición de puertos** | `ports: ["3000:8080"]` publicaba directo al host | `containerPort` es solo informativo; acceso solo con `port-forward` | **Desapareció** la publicación directa (**faltan `Service` e `Ingress`**). |
+| **Persistencia de datos** | Volumen nombrado `catalogo-db-data` montado en `/data/db` | Sin volumen declarado (al recrear `catalogo-db` se pierden los datos) | **Falta almacenamiento persistente (`PV` / `PVC`)**. |
+| **Autorreparación y réplicas** | `restart` en un único host | `kubelet` reinicia contenedores, pero un Pod borrado no se recrea | **Faltan `Deployment`, `ReplicaSet` / `StatefulSet`**. |
+| **Seguridad (`cap_drop`)** | `cap_drop: [ALL]` + 4 `cap_add` mínimas en `mongo:7` | Sin restricciones de capabilities declaradas todavía | **Falta configurar `securityContext`**. |
+
+**Conclusión:** Esta entrega conserva intactas las imágenes y el contrato de variables de entorno de la Semana 4, pero expone de forma deliberada todo lo que falta al migrar únicamente a Pods sueltos: nombres DNS estables (`Service`), autorreparación a nivel de Pod (`Deployment`/`StatefulSet`), sondas de salud (`probes`), configuración desacoplada (`ConfigMap`/`Secret`), persistencia (`PV`/`PVC`) y exposición externa (`Ingress`), recursos que se incorporarán progresivamente en las semanas 6 a 8.
