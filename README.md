@@ -711,9 +711,34 @@ catalogo-frontend   0/1     Error     4 (75s ago)   3m9s    10.244.0.26   jflore
 
 ```bash
 $ kubectl describe pod catalogo-api
+```
+```text
+...
+Events:
+  Normal   Scheduled  8m27s                 default-scheduler  Successfully assigned catalogo-app/catalogo-api to jflores
+  Normal   Pulled     108s (x4 over 6m20s)  kubelet            Container image "jmfloress04/catalogo-api:v1" already present on machine and can be accessed by the pod
+  Normal   Created    107s (x5 over 7m21s)  kubelet            Container created
+  Normal   Started    107s (x5 over 7m19s)  kubelet            Container started
+  Warning  BackOff    47s (x4 over 5m20s)   kubelet            Back-off restarting failed container catalogo-api in pod catalogo-api_catalogo-app(...)
+```
+```bash
 $ kubectl logs catalogo-api --previous
 ```
-
+```text
+unable to retrieve container logs for containerd://fa3cd58937b9b48bc149f5f316943d86647dbcceeef40b393a597ded46e7c9c0
+```
+```bash
+$ kubectl logs catalogo-api
+```
+```text
+INFO:     Started server process [1]
+INFO:     Waiting for application startup.
+[2026-11-23T05:36:33+0000] WARNING intento 1/10 de conexión falló: catalogo-db:27017: [Errno -2] Name or service not known ...
+...
+[2026-11-23T05:37:27+0000] WARNING intento 10/10 de conexión falló: catalogo-db:27017: [Errno -2] Name or service not known ...
+pymongo.errors.ServerSelectionTimeoutError: catalogo-db:27017: [Errno -2] Name or service not known (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms), Timeout: 3.0s, Topology Description: <TopologyDescription id: 6b03d0ded19a167c7c7bb84f, topology_type: Unknown, servers: [<ServerDescription ('catalogo-db', 27017) server_type: Unknown, rtt: None, error=AutoReconnect('catalogo-db:27017: [Errno -2] Name or service not known ...')>]>
+ERROR:    Application startup failed. Exiting.
+```
 *Nota: al consultar `kubectl logs catalogo-api --previous` mientras el contenedor actual ya estaba en `Terminated` esperando backoff, `containerd` devolvió `unable to retrieve container logs` sobre la instancia más antigua; los logs del fallo completo se obtuvieron directamente con `kubectl logs catalogo-api`.*
 
 **Conclusión:** El error informado por `pymongo` es **`ServerSelectionTimeoutError`** (`[Errno -2] Name or service not known`) y **NO** `Authentication failed`. Esto ocurre porque `DB_HOST=catalogo-db` ni siquiera pudo resolverse en DNS: en Kubernetes un Pod suelto no provee un nombre resoluble a ningún otro Pod (esa es la función de un **`Service`**, que todavía no existe). Al fallar en la resolución de nombres antes de abrir la conexión TCP, la API nunca alcanzó a MongoDB y por eso jamás llegó a la instancia de autenticación donde aparecería `Authentication failed`.
