@@ -1,7 +1,24 @@
-# Catálogo App
+# Catálogo App — Variante C
+
+Catálogo de productos con imágenes (**React + Vite** servido por **Nginx unprivileged** · **Python + FastAPI** · **MongoDB 7**). Proyecto integrador de *Contenedores, Docker y Orquestación con Kubernetes* (FACET – UNT).
+
+### Documentación y artefactos de la entrega final
+
+| Artefacto | Ubicación | Descripción |
+| :--- | :--- | :--- |
+| Dockerfiles multietapa | `backend/Dockerfile`, `frontend/Dockerfile` | Imágenes sin herramientas de compilación, no-root y configuración en tiempo de ejecución. |
+| Docker Compose | `docker-compose.yml`, `.env.example` | Las tres capas en una sola máquina con red `catalogo-net`, volumen persistente y healthchecks. |
+| Manifiestos de Kubernetes | `k8s/` | Los **12 objetos** del despliegue en archivos individuales (`3` Deployments, `3` Services, `2` ConfigMaps, `1` Secret ejemplo, `1` PVC, `1` Ingress, `1` HPA). |
+| Chart de Helm | `catalogo-app/` | `Chart.yaml`, `values.yaml` y las **12 plantillas** parametrizadas en `templates/`. |
+| Documento de arquitectura | [ARQUITECTURA.md](ARQUITECTURA.md) | Respuestas a las preguntas obligatorias, pregunta propia de la Variante C, dificultades reales de MongoDB y pendientes para producción. |
+| Informe de funcionamiento | [INFORME.md](INFORME.md) | Demostración con registros de comandos reales (Ingress, HPA `-w`, `helm history`, doble `helm template` y prueba *stateless* a 3 réplicas). |
 
 ## Índice
 
+- **[Cómo levantar el proyecto](#cómo-levantar-el-proyecto)**
+  - [Camino 1 — Con Docker Compose (en una sola máquina)](#camino-1--con-docker-compose-en-una-sola-máquina)
+  - [Camino 2 — Con Helm (sobre el clúster Kubernetes)](#camino-2--con-helm-sobre-el-clúster-kubernetes)
+  - [Credenciales de laboratorio y manifiestos individuales (`k8s/`)](#credenciales-de-laboratorio-y-manifiestos-individuales-k8s)
 - **[Etapa 1 — Arquitectura](#etapa-1--arquitectura)**
 - **[Etapa 2 — Medición y Optimización de Imágenes](#etapa-2--medición-y-optimización-de-imágenes)**
   - [Qué aportó cada decisión](#qué-aportó-cada-decisión)
@@ -64,6 +81,102 @@
   - [7. Ciclo completo de Release: `helm upgrade` (`v2`), `helm history` y `helm rollback` (`v1`)](#7-ciclo-completo-de-release-helm-upgrade-v2-helm-history-y-helm-rollback-v1)
 
 ---
+
+## Cómo levantar el proyecto
+
+### Camino 1 — Con Docker Compose (en una sola máquina)
+
+**Requisitos:** Docker Engine y Docker Compose v2 (`docker compose`).
+
+1. **Crear el archivo `.env` local** a partir de la plantilla (`.env` está excluido en `.gitignore` para no versionar contraseñas):
+   ```bash
+   cp .env.example .env
+   ```
+   Editar `.env` definiendo las credenciales de laboratorio (asegurando que `MONGO_INITDB_ROOT_USERNAME`/`PASSWORD` coincidan con `DB_USER`/`DB_PASSWORD`).
+
+2. **Construir las imágenes y levantar las tres capas:**
+   ```bash
+   docker compose up -d --build
+   ```
+   Compose crea la red `catalogo-net`, el volumen persistente `catalogo-db-data` y respeta el orden de arranque mediante healthchecks (`catalogo-db` → `catalogo-api` → `catalogo-frontend`).
+
+3. **Verificar estado y acceder a la aplicación:**
+   ```bash
+   docker compose ps
+   ```
+   - **Aplicación web (Frontend + proxy):** `http://localhost:3000`
+   - **Salud de la API (a través del proxy):** `http://localhost:3000/api/health`
+   - **Documentación interactiva (Swagger UI):** `http://localhost:3000/api/docs`
+
+4. **Detener el entorno:**
+   ```bash
+   # Detiene y elimina contenedores conservando los datos en catalogo-db-data:
+   docker compose down
+
+   # Para borrar también el volumen de MongoDB y reiniciar desde cero:
+   docker compose down -v
+   ```
+
+### Camino 2 — Con Helm (sobre el clúster Kubernetes)
+
+**Requisitos:** clúster Kubernetes con `kubectl` configurado, `Helm 3`, `ingress-nginx` (Ingress Controller), aprovisionador de almacenamiento por defecto (`StorageClass`) y `metrics-server` (para el HPA).
+
+1. **Validar el Chart y las plantillas antes de instalar:**
+   ```bash
+   helm lint ./catalogo-app
+   ```
+
+2. **Instalar los 12 objetos en un único comando** (pasando credenciales de laboratorio por `--set` o mediante un archivo local `catalogo-app/values-secret.yaml`, ignorado en `.gitignore`):
+   ```bash
+   # Opción A: pasando credenciales de laboratorio por --set
+   helm install catalogo-app ./catalogo-app \
+     -n catalogo-app --create-namespace \
+     --set db.auth.username=catalogo_lab_user \
+     --set db.auth.password=catalogo_lab_pass
+
+   # Opción B: usando un archivo local de overrides (ignorado por Git)
+   helm install catalogo-app ./catalogo-app \
+     -n catalogo-app --create-namespace \
+     -f catalogo-app/values-secret.yaml
+   ```
+
+3. **Verificar el despliegue completo y configurar resolución local del Ingress:**
+   ```bash
+   kubectl get all,cm,secret,pvc,ingress,hpa -n catalogo-app
+   ```
+   Tomar la IP listada en la columna `ADDRESS` de `catalogo-app-ingress` y agregarla en `/etc/hosts` apuntando al host configurado en `values.yaml`:
+   ```text
+   <INGRESS_ADDRESS> catalogo.local
+   ```
+   Luego abrir:
+   - **Aplicación web:** `http://catalogo.local`
+   - **API detrás del Ingress:** `http://catalogo.local/api/productos`
+   - **Swagger UI:** `http://catalogo.local/api/docs`
+
+4. **Ciclo de vida de la release (actualización, historial, reversión y desinstalación):**
+   ```bash
+   # Actualizar la API a v2 (repetir los valores de credenciales o usar --reuse-values):
+   helm upgrade catalogo-app ./catalogo-app -n catalogo-app \
+     --reuse-values --set api.image.tag=v2
+
+   # Consultar revisiones y revertir a la revisión 1:
+   helm history catalogo-app -n catalogo-app
+   helm rollback catalogo-app 1 -n catalogo-app
+
+   # Desinstalar la release:
+   helm uninstall catalogo-app -n catalogo-app
+   ```
+
+### Credenciales de laboratorio y manifiestos individuales (`k8s/`)
+
+- **Sin credenciales reales en el repositorio:** tanto `.env.example`, `k8s/secret-catalogo-db.yaml.example` como `catalogo-app/values.yaml` contienen únicamente valores de ejemplo / placeholders de laboratorio. Los archivos con credenciales locales (`.env`, `k8s/secret-catalogo-db.yaml`, `catalogo-app/values-secret.yaml`) están excluidos explícitamente en `.gitignore`. La estrategia de gestión segura de secretos en producción se detalla en [ARQUITECTURA.md](ARQUITECTURA.md#4-qué-quedaría-pendiente-para-un-entorno-de-producción-real).
+- **Si se desea aplicar los 12 manifiestos sueltos de `k8s/` sin Helm:**
+  1. Copiar `k8s/secret-catalogo-db.yaml.example` a `k8s/secret-catalogo-db.yaml` y completar credenciales de laboratorio.
+  2. Crear el namespace (`kubectl create namespace catalogo-app`) y aplicar respetando dependencias (`Secret`, `ConfigMaps`, `PVC` y `Services` antes que los `Deployments`, `HPA` e `Ingress`).
+
+---
+
+<!-- Bitácora completa del curso: Etapas 1 a 8 -->
 
 ## Etapa 1 — Arquitectura
 
@@ -416,7 +529,7 @@ docker exec catalogo-db mongosh "mongodb://catalogo_user:catalogo_pass@localhost
 13
 ```
 
-El producto cargado desde el navegador en el paso 6 continuó disponible **con su imagen y con su identificador original**, porque los bytes de la imagen se almacenan dentro del documento en MongoDB (en el volumen `catalogo-db-data`) y no en el disco efímero del contenedor `catalogo-api`. Esto mantiene a la API sin estado (*stateless*) y permite escalarla a múltiples réplicas en Kubernetes (Semana 6).
+El producto cargado desde el navegador en el paso 6 continuó disponible **con su imagen y con su identificador original**, porque los bytes de la imagen se almacenan dentro del documento en MongoDB (en el volumen `catalogo-db-data`) y no en el disco efímero del contenedor `catalogo-api`. Esto mantiene a la API sin estado (*stateless*) y permite escalarla a múltiples réplicas en Kubernetes (Etapa 6).
 
 ### Orden de arranque manual
 
@@ -430,8 +543,8 @@ Para levantar `catalogo-app` con `docker run` debe respetarse estrictamente este
 - **API antes que la base de datos:** la API no logra conectar con MongoDB al arrancar (reintentos fallidos en `esperar_mongo()` hasta agotar intentos y salir con error).
 - **Frontend antes que la API:** Nginx resuelve el *upstream* `catalogo-api` una única vez al iniciar; si aún no existe en el DNS de `catalogo-net`, no reintenta y muere de inmediato (`Exited (1)`) con `nginx: [emerg] host not found in upstream "catalogo-api"`.
 
-**Limitación actual (resuelta en la Semana 4):**
-Todo este orden de arranque, las variables de entorno, la red y el volumen residen hoy únicamente en la memoria del operador (o como comandos sueltos en este `README.md`) y no en ningún archivo ejecutable. En la Semana 4, **Docker Compose** (`docker-compose.yml`) reemplaza esta secuencia manual por una definición declarativa reproducible con un solo comando.
+**Limitación actual (resuelta en la Etapa 4):**
+Todo este orden de arranque, las variables de entorno, la red y el volumen residen hoy únicamente en la memoria del operador (o como comandos sueltos en este `README.md`) y no en ningún archivo ejecutable. En la Etapa 4, **Docker Compose** (`docker-compose.yml`) reemplaza esta secuencia manual por una definición declarativa reproducible con un solo comando.
 
 ## Etapa 4 — Docker Compose y Seguridad Básica
 
@@ -730,7 +843,7 @@ Luego se editó `k8s/pod-catalogo-db.yaml` limpiando los campos vacíos (`resour
 
 ### 4. Despliegue de las tres capas como Pods sueltos y registro de IPs
 
-Se crearon `k8s/pod-catalogo-api.yaml` (incluyendo `ROOT_PATH=/api`) y `k8s/pod-catalogo-frontend.yaml` con las variables de la semana 3, y se aplicaron los tres manifiestos en orden (`db` → `api` → `frontend`):
+Se crearon `k8s/pod-catalogo-api.yaml` (incluyendo `ROOT_PATH=/api`) y `k8s/pod-catalogo-frontend.yaml` con las variables de la etapa 3, y se aplicaron los tres manifiestos en orden (`db` → `api` → `frontend`):
 
 ```bash
 $ kubectl apply -f k8s/pod-catalogo-db.yaml
@@ -816,7 +929,7 @@ Al reemplazar temporalmente `DB_HOST` en `k8s/pod-catalogo-api.yaml` por la dire
 
 A continuación se eliminó el Pod `catalogo-db` y se volvió a crear con el mismo manifiesto `k8s/pod-catalogo-db.yaml`. Kubernetes le asignó una dirección IP diferente (`<IP_NUEVA>` en lugar de `10.244.0.24`), provocando que `catalogo-api` volviera a fallar al seguir apuntando a una dirección inexistente.
 
-**Conclusión:** La dirección IP de un Pod es efímera y descartable: cada vez que un Pod se elimina, se reprograma o se recrea, recibe una IP nueva del clúster, por lo que nunca sirve como punto de configuración. En ese hecho reside la razón de existir de los **`Services`** (Semana 6), que proveen una IP virtual estable y un nombre DNS fijo (`catalogo-db`) por delante de Pods cuyas IPs cambian constantemente.
+**Conclusión:** La dirección IP de un Pod es efímera y descartable: cada vez que un Pod se elimina, se reprograma o se recrea, recibe una IP nueva del clúster, por lo que nunca sirve como punto de configuración. En ese hecho reside la razón de existir de los **`Services`** (Etapa 6), que proveen una IP virtual estable y un nombre DNS fijo (`catalogo-db`) por delante de Pods cuyas IPs cambian constantemente.
 
 *Nota de estado final: tras completar las pruebas de la Consigna 8, se restituyó `DB_HOST: "catalogo-db"` en `k8s/pod-catalogo-api.yaml`; el manifiesto queda deliberadamente roto hasta que se cree el `Service` correspondiente en la siguiente entrega.*
 
@@ -826,11 +939,11 @@ Al desplegar `k8s/pod-catalogo-frontend.yaml`, Nginx vuelve a fallar al arrancar
 
 | Etapa | Mensaje de error en Nginx | Causa raíz | Cómo se resuelve |
 | :---: | :--- | :--- | :--- |
-| **Semana 3** (`docker run`) | `host not found in upstream "catalogo-api:8000"` | **Faltaba la red custom** (`catalogo-net`) con DNS interno embebido, o la API aún no había sido creada. | Crear la red `bridge` custom `catalogo-net` y levantar `catalogo-api` antes del frontend. |
-| **Semana 4** (`docker compose`) | `host not found in upstream "catalogo-api:8000"` | **Condición de carrera al arrancar:** sin `depends_on`, Compose iniciaba Nginx antes de que existiera `catalogo-api`. | Declarar `depends_on` (con `condition: service_healthy`) en `docker-compose.yml`. |
-| **Semana 5** (Kubernetes — Pods sueltos) | `host not found in upstream "catalogo-api:8000"` | **Falta el `Service`:** aunque `catalogo-api` exista y esté corriendo, un Pod suelto no registra ningún nombre DNS en CoreDNS. | Crear un objeto **`Service`** llamado `catalogo-api` (Semana 6). |
+| **Etapa 3** (`docker run`) | `host not found in upstream "catalogo-api:8000"` | **Faltaba la red custom** (`catalogo-net`) con DNS interno embebido, o la API aún no había sido creada. | Crear la red `bridge` custom `catalogo-net` y levantar `catalogo-api` antes del frontend. |
+| **Etapa 4** (`docker compose`) | `host not found in upstream "catalogo-api:8000"` | **Condición de carrera al arrancar:** sin `depends_on`, Compose iniciaba Nginx antes de que existiera `catalogo-api`. | Declarar `depends_on` (con `condition: service_healthy`) en `docker-compose.yml`. |
+| **Etapa 5** (Kubernetes — Pods sueltos) | `host not found in upstream "catalogo-api:8000"` | **Falta el `Service`:** aunque `catalogo-api` exista y esté corriendo, un Pod suelto no registra ningún nombre DNS en CoreDNS. | Crear un objeto **`Service`** llamado `catalogo-api` (Etapa 6). |
 
-**Conclusión:** Aunque el mensaje de error de Nginx es idéntico al de la tercera semana, la causa arquitectónica es distinta: entonces faltaba la red de Docker con DNS interno, mientras que en Kubernetes falta el **`Service`** que exponga el nombre `catalogo-api` dentro de CoreDNS.
+**Conclusión:** Aunque el mensaje de error de Nginx es idéntico al de la tercera etapa, la causa arquitectónica es distinta: entonces faltaba la red de Docker con DNS interno, mientras que en Kubernetes falta el **`Service`** que exponga el nombre `catalogo-api` dentro de CoreDNS.
 
 ### 8. Acceso temporal sin `Service` mediante `kubectl port-forward`
 
@@ -846,7 +959,7 @@ $ curl -s localhost:8000/productos | head -c 250
 
 Al acceder a `http://localhost:8000/docs`, Swagger UI devuelve el HTML inicial (`200 OK`) pero **no logra cargar la definición de la API** porque intenta descargar `/api/openapi.json` y recibe **`404 Not Found`**.
 
-**Conclusión:** El `404` en `/docs` (`/api/openapi.json`) **no es un error**, sino la consecuencia directa de haber configurado `ROOT_PATH=/api` desde la Semana 3 para funcionar detrás del proxy reverso Nginx: al entrar directo al Pod por `port-forward` no existe ningún proxy delante que maneje el prefijo `/api`. Además, **`kubectl port-forward` es únicamente una herramienta de depuración temporal y no un mecanismo de publicación**: escucha solo en `127.0.0.1` local, termina al cerrar la terminal y se interrumpe si el Pod se reinicia porque apunta a un Pod concreto y no a un `Service`.
+**Conclusión:** El `404` en `/docs` (`/api/openapi.json`) **no es un error**, sino la consecuencia directa de haber configurado `ROOT_PATH=/api` desde la Etapa 3 para funcionar detrás del proxy reverso Nginx: al entrar directo al Pod por `port-forward` no existe ningún proxy delante que maneje el prefijo `/api`. Además, **`kubectl port-forward` es únicamente una herramienta de depuración temporal y no un mecanismo de publicación**: escucha solo en `127.0.0.1` local, termina al cerrar la terminal y se interrumpe si el Pod se reinicia porque apunta a un Pod concreto y no a un `Service`.
 
 ### 9. Mortalidad de los Pods sueltos
 
@@ -873,7 +986,7 @@ Los diez comandos de `kubectl` efectivamente utilizados durante esta entrega:
 
 ### 11. Comparación: `docker-compose.yml` vs. manifiestos `k8s/`
 
-| Aspecto | `docker-compose.yml` (Semana 4) | Manifiestos `k8s/pod-*.yaml` (Semana 5) | Qué ocurrió |
+| Aspecto | `docker-compose.yml` (Etapa 4) | Manifiestos `k8s/pod-*.yaml` (Etapa 5) | Qué ocurrió |
 | :--- | :--- | :--- | :--- |
 | **Imágenes OCI** | `build:` local + `image:` en caché del Docker Engine | `image: jmfloress04/catalogo-*:v1` descargadas desde Docker Hub | **Se conservó** la misma imagen sin cambios; cambió la distribución vía registry. |
 | **Variables de entorno** | Bloque `environment:` con interpolación desde `.env` | Lista `env:` (`name`/`value` como strings) dentro de cada manifiesto | **Se conservó** el contrato (`DB_*`, `ROOT_PATH=/api`, `API_*`), pero los secretos volvieron inline (**faltan `ConfigMap` y `Secret`**). |
@@ -884,7 +997,7 @@ Los diez comandos de `kubectl` efectivamente utilizados durante esta entrega:
 | **Autorreparación y réplicas** | `restart` en un único host | `kubelet` reinicia contenedores, pero un Pod borrado no se recrea | **Faltan `Deployment`, `ReplicaSet` / `StatefulSet`**. |
 | **Seguridad (`cap_drop`)** | `cap_drop: [ALL]` + 4 `cap_add` mínimas en `mongo:7` | Sin restricciones de capabilities declaradas todavía | **Falta configurar `securityContext`**. |
 
-**Conclusión:** Esta entrega conserva intactas las imágenes y el contrato de variables de entorno de la Semana 4, pero expone de forma deliberada todo lo que falta al migrar únicamente a Pods sueltos: nombres DNS estables (`Service`), autorreparación a nivel de Pod (`Deployment`/`StatefulSet`), sondas de salud (`probes`), configuración desacoplada (`ConfigMap`/`Secret`), persistencia (`PV`/`PVC`) y exposición externa (`Ingress`), recursos que se incorporarán progresivamente en las semanas 6 a 8.
+**Conclusión:** Esta entrega conserva intactas las imágenes y el contrato de variables de entorno de la Etapa 4, pero expone de forma deliberada todo lo que falta al migrar únicamente a Pods sueltos: nombres DNS estables (`Service`), autorreparación a nivel de Pod (`Deployment`/`StatefulSet`), sondas de salud (`probes`), configuración desacoplada (`ConfigMap`/`Secret`), persistencia (`PV`/`PVC`) y exposición externa (`Ingress`), recursos que se incorporarán progresivamente en las etapas 6 a 8.
 
 ## Etapa 6 — Deployments, Services, Rolling Updates y Réplicas sin Estado
 
@@ -1139,7 +1252,7 @@ $ curl -s http://172.16.21.16:30302/api/productos | grep -o '"sku"' | wc -l
 ```
 
 - **Advertencia sobre el falso positivo de Variante C:** los 12 productos del catálogo de demostración reaparecen siempre porque la siembra (`SEED_DEMO=true`) es idempotente y se ejecuta en cada arranque de la API. La prueba válida de persistencia es el **producto cargado manualmente con su imagen** (`13` productos antes y después, verificado también en el navegador).
-- **Cierre de limitación de Semana 6:** con `catalogo-db-pvc` montado en `/data/db`, queda resuelta la limitación de datos efímeros que el TP-06 había dejado declarada por escrito.
+- **Cierre de limitación de Etapa 6:** con `catalogo-db-pvc` montado en `/data/db`, queda resuelta la limitación de datos efímeros que el TP-06 había dejado declarada por escrito.
 
 ### Exposición HTTP con Ingress: `catalogo-app-ingress`
 
@@ -1314,7 +1427,7 @@ $ helm template catalogo-app ./catalogo-app -n catalogo-app \
   maxReplicas: 9
 ```
 
-- **Orden fijo por tipo de objeto:** Helm aplica `Secret → ConfigMap → PVC → Service → Deployment → HPA → Ingress`. Al crear los `Services` antes que los `Deployments`, desaparece automáticamente el error `host not found in upstream` observado en la Semana 6 cuando Nginx arrancaba antes de existir el DNS `catalogo-api`.
+- **Orden fijo por tipo de objeto:** Helm aplica `Secret → ConfigMap → PVC → Service → Deployment → HPA → Ingress`. Al crear los `Services` antes que los `Deployments`, desaparece automáticamente el error `host not found in upstream` observado en la Etapa 6 cuando Nginx arrancaba antes de existir el DNS `catalogo-api`.
 - **Decisión de conexión a MongoDB (Variante C):** se sostiene el modelo de **piezas separadas** (`DB_HOST`, `DB_PORT`, `DB_NAME` en `catalogo-api-config` + `MONGO_INITDB_ROOT_USERNAME` / `MONGO_INITDB_ROOT_PASSWORD` en `catalogo-db-secret`, renombradas a `DB_USER` / `DB_PASSWORD` vía `valueFrom.secretKeyRef`). Así existe una única fuente de verdad para la contraseña, no se duplica ni se mezcla con configuración pública, y `backend/main.py` agrega `?authSource=admin` automáticamente (evitando el fallo `Authentication failed` que ocurre al componer una `MONGO_URI` incompleta o partida entre ConfigMap y Secret).
 
 ### 6. Instalación limpia de la Release con `helm install --create-namespace`
