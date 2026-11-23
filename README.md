@@ -991,3 +991,140 @@ Se verificó experimentalmente que `catalogo-db` corre actualmente como un `Depl
 **Limitación declarada y arquitectura:**
 - **Persistencia pendiente (Etapa 7):** Esta limitación es conocida y explícita en la etapa 6 y se resolverá en la **Etapa 7** adjuntando un volumen persistente (**`PersistentVolumeClaim` / `PVC`**) a `/data/db`.
 - **No escalar la base de datos:** `catalogo-db` permanece estrictamente en **`replicas: 1`**. Escalarlo (`--replicas=3`) sería aceptado sin error por Kubernetes, pero levantaría tres instancias independientes de MongoDB sin *replica set* detrás del mismo Service, devolviendo catálogos inconsistentes en cada solicitud.
+
+## Etapa 7 — ConfigMaps, Secrets, Almacenamiento e Ingress
+
+### Secret `catalogo-db-secret` (Base64 no es cifrado)
+- `k8s/secret-catalogo-db.yaml` se excluyó de Git mediante `.gitignore`.
+- Al inspeccionar el objeto con 
+```bash
+kubectl get secret catalogo-db-secret -n catalogo-app -o jsonpath='{.data.MONGO_INITDB_ROOT_PASSWORD}' | base64 -d
+```
+se obtiene el valor en texto plano (`catalogo_pass`), demostrando que Kubernetes solo codifica el dato en **Base64** y no lo cifra (además, al aplicar con `kubectl apply` usando `stringData`, el texto plano queda en la anotación `last-applied-configuration`).
+- **Protección real:** para proteger efectivamente estas credenciales hace falta habilitar **cifrado en reposo en `etcd`** (junto con políticas RBAC) o bien utilizar un **gestor de secretos externo** (por ejemplo, HashiCorp Vault o AWS/GCP Secrets Manager).
+
+### Conexión a MongoDB: piezas sueltas vs. `MONGO_URI` completa
+- **Decisión:** se eligió pasar la configuración en **piezas separadas** (`DB_HOST`, `DB_PORT`, `DB_NAME` desde el ConfigMap `catalogo-api-config`, y `DB_USER`, `DB_PASSWORD` renombradas con `valueFrom.secretKeyRef` desde `catalogo-db-secret`).
+- **Justificación:**
+  1. **Sin duplicar credenciales:** MongoDB y la API consumen exactamente las mismas claves del único Secret (`MONGO_INITDB_ROOT_USERNAME` / `MONGO_INITDB_ROOT_PASSWORD`); con `MONGO_URI` habría que repetir la contraseña y meter datos no sensibles (`host`, `port`, `db`) dentro del Secret.
+  2. **Manejo automático de `?authSource=admin`:** con piezas separadas la API arma la URI y agrega `?authSource=admin` por sí misma; si se escribiera `MONGO_URI` manualmente en el Secret sin ese parámetro, la autenticación fallaría con `Authentication failed` porque el usuario creado por `MONGO_INITDB_ROOT_*` vive en la base `admin`.
+- **Verificación real:** como la API posee valores por omisión que coinciden con Compose, que responda no alcanza para validar la inyección; se confirmó mediante `kubectl exec deploy/catalogo-api -n catalogo-app -- env` (y en el frontend con `env | grep API_`).
+
+### Persistencia de MongoDB: `catalogo-db-pvc`
+
+Se creó el PersistentVolumeClaim `catalogo-db-pvc` (`k8s/pvc-catalogo-db.yaml`) solicitando `1Gi` en modo **`ReadWriteOnce` (`RWO`)** y **sin especificar `storageClassName`** para que tome automáticamente la `StorageClass` por defecto del clúster (`local-path`), manteniendo el manifiesto portable entre entornos (`kind`, `minikube`, `kubeadm`).
+
+#### 1. Estado inmediatamente después de aplicar el PVC (antes del Pod)
+```text
+$ kubectl get pvc,pv -n catalogo-app
+NAME                                    STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+persistentvolumeclaim/catalogo-db-pvc   Pending                                      local-path     <unset>                 7s
+
+$ kubectl describe pvc catalogo-db-pvc -n catalogo-app | tail -5
+Events:
+  Type    Reason                Age               From                         Message
+  ----    ------                ----              ----                         -------
+  Normal  WaitForFirstConsumer  6s (x2 over 14s)  persistentvolume-controller  waiting for first consumer to be created before binding
+```
+El estado `Pending` inicial **no es un error**: la `StorageClass` `local-path` utiliza modo de enlace `WaitForFirstConsumer`, por lo que difiere la creación física del `PersistentVolume` hasta que exista un Pod consumidor y el scheduler defina en qué nodo se ejecutará.
+
+#### 2. Montaje en `catalogo-db` y transición a `Bound`
+Se montó `catalogo-db-pvc` en `/data/db` dentro de `k8s/deploy-catalogo-db.yaml` (declarando el reclamo en `spec.template.spec.volumes` a nivel Pod y el montaje en `volumeMounts` a nivel contenedor, junto con `strategy.type: Recreate` para evitar que dos instancias de `mongod` compitan por el mismo volumen `RWO` al reiniciarse). Al crearse el Pod, el aprovisionador dinámico generó el `PV` y los ligó 1 a 1:
+
+```text
+$ kubectl get pvc,pv -n catalogo-app
+NAME                                    STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+persistentvolumeclaim/catalogo-db-pvc   Bound    pvc-306954b6-4d37-4a65-9e9d-dcd9b33799b3   1Gi        RWO            local-path     <unset>                 3m50s
+
+NAME                                                        CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM                          STORAGECLASS   VOLUMEATTRIBUTESCLASS   REASON   AGE
+persistentvolume/pvc-306954b6-4d37-4a65-9e9d-dcd9b33799b3   1Gi        RWO            Delete           Bound    catalogo-app/catalogo-db-pvc   local-path     <unset>                          6s
+```
+
+#### 3. Por qué MongoDB no necesita `subPath` y verificación de permisos en `/data/db`
+- **Sin `subPath` (diferencia entre motores):** a diferencia de MySQL (Variante B), que aborta la inicialización si encuentra directorios preexistentes (como `lost+found`) en la raíz del volumen y por ello requiere `subPath`, **MongoDB no exige que `/data/db` esté vacío**, de modo que el PVC se monta directamente sobre `/data/db` sin `subPath`.
+- **Propietario y permisos:** lo que sí debe verificarse en MongoDB es que el usuario `mongodb` del contenedor tenga permiso de escritura sobre `/data/db` para evitar fallos `Permission denied` en almacenamientos con permisos restrictivos. Con `local-path` del clúster del curso, el directorio queda con permisos `777` y propietario `mongodb`:
+
+```text
+$ kubectl exec deploy/catalogo-db -n catalogo-app -- ls -ld /data/db
+drwxrwxrwx 5 mongodb root 4096 Nov 23 16:47 /data/db
+```
+
+### Verificación de persistencia y cierre de la limitación
+
+Se cargó un producto nuevo a mano con su imagen desde el navegador (`12` demo + `1` manual = **`13`** productos), se eliminó el Pod de MongoDB y se comprobó que el nuevo Pod recreado por el Deployment montó el mismo PVC `catalogo-db-pvc` conservando los datos intactos:
+
+```text
+# Antes de eliminar el Pod de MongoDB (12 demo + 1 cargado a mano):
+$ curl -s http://172.16.21.16:30302/api/productos | grep -o '"sku"' | wc -l
+13
+
+# Eliminación y recreación automática del Pod de la base de datos:
+$ kubectl delete pod -l app=catalogo-db -n catalogo-app
+pod "catalogo-db-558886cdd5-5hrjt" deleted from catalogo-app namespace
+
+$ kubectl get pods -n catalogo-app -l app=catalogo-db -w
+NAME                           READY   STATUS    RESTARTS   AGE
+catalogo-db-558886cdd5-7lf2j   1/1     Running   0          11s
+
+# Después de recrearse el Pod (el producto cargado a mano y su imagen permanecen):
+$ curl -s http://172.16.21.16:30302/api/productos | grep -o '"sku"' | wc -l
+13
+```
+
+- **Advertencia sobre el falso positivo de Variante C:** los 12 productos del catálogo de demostración reaparecen siempre porque la siembra (`SEED_DEMO=true`) es idempotente y se ejecuta en cada arranque de la API. La prueba válida de persistencia es el **producto cargado manualmente con su imagen** (`13` productos antes y después, verificado también en el navegador).
+- **Cierre de limitación de Semana 6:** con `catalogo-db-pvc` montado en `/data/db`, queda resuelta la limitación de datos efímeros que el TP-06 había dejado declarada por escrito.
+
+### Exposición HTTP con Ingress: `catalogo-app-ingress`
+
+Se creó el Ingress `catalogo-app-ingress` (`k8s/ingress-catalogo-app.yaml`) con `ingressClassName: nginx`, host `catalogo.local` y **una sola regla**: `/` (`Prefix`) dirigida a `catalogo-frontend:8080`. Se obtuvo la `EXTERNAL-IP` del `nginx-ingress-controller` (`172.16.21.209`, distinta de la IP del nodo `172.16.21.16`) y se agregó `172.16.21.209 catalogo.local` a `/etc/hosts`.
+
+```text
+$ kubectl get ingress -n catalogo-app
+NAME                   CLASS   HOSTS            ADDRESS         PORTS   AGE
+catalogo-app-ingress   nginx   catalogo.local   172.16.21.209   80      4m43s
+```
+
+- **Por qué NO se agrega una regla `/api`:** el Nginx interno del contenedor `catalogo-frontend` ya actúa como proxy inverso hacia `catalogo-api:8000`. Duplicar la regla `/api` en el Ingress crearía **dos fuentes de verdad** para la misma decisión de enrutamiento y rompería la paridad con Docker Compose (donde no existe Ingress).
+- **Verificación válida (`/api/productos`) vs. falso positivo SPA (`/productos`):** por la directiva `try_files` de la aplicación React (SPA), cualquier ruta inexistente fuera de `/api` devuelve `200 OK` con `index.html`. Un código `200` por sí solo no alcanza para probar que el Ingress llega a la API:
+
+```text
+# Ruta válida (/api/productos) -> 200 OK con application/json (datos reales de FastAPI/MongoDB):
+$ curl -s -i http://catalogo.local/api/productos | head -c 400
+HTTP/1.1 200 OK
+Server: nginx/1.31.6
+Content-Type: application/json
+Content-Length: 4297
+
+[{"sku":999666,"categoria":"Apple",...
+
+# Falso positivo SPA (/productos) -> 200 OK pero con text/html (index.html servido por try_files):
+$ curl -s -i http://catalogo.local/productos | head -c 400
+HTTP/1.1 200 OK
+Server: nginx/1.31.6
+Content-Type: text/html
+Content-Length: 397
+
+<!doctype html>
+<html lang="es">...
+```
+
+### Documentación de la API detrás del Ingress
+Al abrir `http://catalogo.local/api/docs` en el navegador, Swagger UI carga correctamente apuntando a `/api/openapi.json`. Esto confirma que `ROOT_PATH="/api"` llega efectivamente desde `catalogo-api-config` hasta FastAPI a través de toda la cadena (`Ingress → Service frontend → Nginx → Service API → FastAPI`); si faltara, la página cargaría en blanco sin errores en los logs.
+
+### Inventario de los 11 objetos actuales del proyecto
+
+| # | Objeto | Tipo | Función |
+| :-: | :--- | :--- | :--- |
+| 1 | `catalogo-db` | `Deployment` | Mantiene `1` réplica de MongoDB 7 con PVC persistente y credenciales desde Secret. |
+| 2 | `catalogo-api` | `Deployment` | Mantiene `2` réplicas *stateless* de FastAPI configuradas vía ConfigMap y Secret renombrado. |
+| 3 | `catalogo-frontend` | `Deployment` | Mantiene `2` réplicas de React + Nginx no-root (`:8080`) con proxy interno `/api`. |
+| 4 | `catalogo-db` | `Service` (`ClusterIP`) | Provee el DNS interno estable `catalogo-db:27017` dentro del clúster. |
+| 5 | `catalogo-api` | `Service` (`ClusterIP`) | Provee el DNS interno estable `catalogo-api:8000` y balancea tráfico hacia la API. |
+| 6 | `catalogo-frontend` | `Service` (`NodePort`) | Expone el frontend internamente en `:8080` (destino del Ingress) y en `:30302` del nodo. |
+| 7 | `catalogo-api-config` | `ConfigMap` | Guarda la configuración no sensible de la API (`DB_HOST`, `DB_PORT`, `DB_NAME`, `ROOT_PATH`, `SEED_DEMO`). |
+| 8 | `catalogo-frontend-config` | `ConfigMap` | Guarda la configuración no sensible del frontend (`API_HOST`, `API_PORT`) para `envsubst`. |
+| 9 | `catalogo-db-secret` | `Secret` (`Opaque`) | Guarda `MONGO_INITDB_ROOT_USERNAME` y `MONGO_INITDB_ROOT_PASSWORD` compartidos por BD y API (fuera de Git). |
+| 10 | `catalogo-db-pvc` | `PersistentVolumeClaim` | Reclama `1Gi` (`ReadWriteOnce`) montado en `/data/db` para persistir MongoDB. |
+| 11 | `catalogo-app-ingress` | `Ingress` | Expone `http://catalogo.local/` (puerto 80) con una única regla hacia `catalogo-frontend:8080`. |
+
+*(En la Etapa 8 se incorporará el 12.° objeto: el autoescalador `HPA`. Los Pods sueltos y el Service auxiliar `catalogo-api-nodeport` de depuración no forman parte del inventario productivo.)*
