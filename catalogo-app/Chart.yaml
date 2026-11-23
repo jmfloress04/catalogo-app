@@ -1,0 +1,6 @@
+apiVersion: v2
+name: catalogo-app
+description: Chart de Helm para catalogo-app (Variante C — React + Vite, FastAPI, MongoDB 7)
+type: application
+version: 0.1.0
+appVersion: "v1"

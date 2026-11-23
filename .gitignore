@@ -7,3 +7,4 @@ kubeconfig*.yaml
 .kube/
 *.conf
 k8s/secret-catalogo-db.yaml
+catalogo-app/values-secret.yaml

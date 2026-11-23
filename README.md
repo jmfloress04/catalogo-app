@@ -1128,3 +1128,206 @@ Al abrir `http://catalogo.local/api/docs` en el navegador, Swagger UI carga corr
 | 11 | `catalogo-app-ingress` | `Ingress` | Expone `http://catalogo.local/` (puerto 80) con una única regla hacia `catalogo-frontend:8080`. |
 
 *(En la Etapa 8 se incorporará el 12.° objeto: el autoescalador `HPA`. Los Pods sueltos y el Service auxiliar `catalogo-api-nodeport` de depuración no forman parte del inventario productivo.)*
+
+## Etapa 8 — Escalado Automático (HPA) y Empaquetado con Helm
+
+### 1. Declaración de `resources.requests` y `limits` en `catalogo-api`
+Antes de crear el `HorizontalPodAutoscaler`, se verificó el funcionamiento de `metrics-server` (`kubectl top nodes` y `kubectl top pods -n catalogo-app`) y se midió el consumo base en reposo de `catalogo-api` (`2m` de CPU y `40–46 Mi` de RAM por réplica, sobre un nodo con ~2 vCPU y ~1.9 GiB de RAM).
+
+En base a esa medición se declararon en `k8s/deploy-catalogo-api.yaml`:
+- **`requests` (`cpu: 100m`, `memory: 64Mi`):** define el mínimo garantizado para el *scheduler* y constituye el **denominador exacto** contra el cual el HPA calcula el porcentaje de CPU (un objetivo del `50 %` equivale a `50m` por Pod, no al 50 % de `limits` ni del nodo). Sin `resources.requests`, el HPA permanece indefinidamente en `<unknown>`.
+- **`limits` (`cpu: 250m`, `memory: 128Mi`):** protege al nodo evitando que un pico o fallo de un Pod consuma todos los recursos (CPU con *throttling* y memoria acotada frente a un nodo que ya opera al 74 % de RAM, permitiendo escalar hasta 6 réplicas sin dejar Pods en `Pending`).
+
+Verificación aplicada en el clúster:
+```text
+$ kubectl describe deploy catalogo-api -n catalogo-app | grep -A6 "Limits:"
+    Limits:
+      cpu:     250m
+      memory:  128Mi
+    Requests:
+      cpu:     100m
+      memory:  64Mi
+```
+
+### 2. Objeto N° 12: Creación del `HorizontalPodAutoscaler` (`catalogo-api-hpa`)
+Se creó `k8s/hpa-catalogo-api.yaml` (`autoscaling/v2`) apuntando al Deployment `catalogo-api` con rango `[2, 6]` réplicas y objetivo `averageUtilization: 50` sobre CPU.
+
+Verificación de métrica activa (sin `<unknown>`):
+```text
+$ kubectl get hpa -n catalogo-app
+NAME               REFERENCE                 TARGETS       MINPODS   MAXPODS   REPLICAS   AGE
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 2%/50%   2         6         2          53s
+```
+
+En `kubectl describe hpa catalogo-api-hpa -n catalogo-app` se confirma explícitamente contra qué valor calcula el porcentaje:
+- `resource cpu on pods (as a percentage of request): 2% (2m) / 50%` → los `2m` en reposo sobre `requests.cpu: 100m` dan exactamente `2 %` (`ScalingActive: True`, `Reason: ValidMetricFound`).
+- **¿Por qué hay un único HPA entre 12 objetos?**
+  - **`catalogo-api` (sí):** capa *stateless* cuya CPU escala con las solicitudes HTTP y la recuperación de imágenes desde MongoDB; el HPA no crea Pods directamente, sino que ajusta `spec.replicas` del Deployment dentro de `[2, 6]` (mínimo `2` para alta disponibilidad y *rolling updates*; máximo `6` para proteger al nodo).
+  - **`catalogo-frontend` (no):** aunque es *stateless*, Nginx sirviendo estáticos consume `0m` de CPU en reposo (`2–4 Mi` de RAM) y casi no se mueve bajo carga; un HPA indemostrable no aporta valor.
+  - **`catalogo-db` (no):** capa *stateful* con PVC `ReadWriteOnce` (`RWO`); múltiples réplicas de un Deployment competirían por el mismo volumen `/data/db`. Escalar la BD requiere un `StatefulSet` / Replica Set.
+
+### 3. Demostración bajo carga real (`2 → 4 → 6 → 3 → 2`)
+Se generó carga real dentro del clúster en dos etapas: primero con un Pod temporal `busybox` sobre `http://catalogo-api:8000/productos` y luego con **3 Pods simultáneos (`carga-1`, `carga-2`, `carga-3`)** consultando el endpoint de imágenes `http://catalogo-api:8000/productos/6b046e42a1573dba71b9c69d/imagen` (que obliga a FastAPI a recuperar los bytes de la imagen desde MongoDB y servirlos). Finalmente se eliminaron los Pods de carga y se esperó la ventana de estabilización.
+
+Secuencia capturada con `kubectl get hpa catalogo-api-hpa -n catalogo-app -w`:
+```text
+NAME               REFERENCE                 TARGETS       MINPODS   MAXPODS   REPLICAS   AGE
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 2%/50%   2         6         2          5m9s
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 8%/50%   2         6         2          6m30s
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 208%/50%   2         6         2          6m45s
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 188%/50%   2         6         4          7m
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 102%/50%   2         6         6          7m15s
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 38%/50%    2         6         6          7m30s
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 2%/50%     2         6         6          7m45s
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 42%/50%    2         6         6          8m45s
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 122%/50%   2         6         6          9m
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 123%/50%   2         6         6          9m45s
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 120%/50%   2         6         6          10m
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 114%/50%   2         6         6          10m
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 19%/50%    2         6         6          10m
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 2%/50%     2         6         6          10m
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 2%/50%     2         6         6          15m
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 2%/50%     2         6         3          15m
+catalogo-api-hpa   Deployment/catalogo-api   cpu: 2%/50%     2         6         2          15m
+```
+
+Eventos registrados en `kubectl describe hpa catalogo-api-hpa -n catalogo-app`:
+```text
+Events:
+  Type    Reason             Age   From                       Message
+  ----    ------             ----  ----                       -------
+  Normal  SuccessfulRescale  10m   horizontal-pod-autoscaler  New size: 4; reason: cpu resource utilization (percentage of request) above target
+  Normal  SuccessfulRescale  10m   horizontal-pod-autoscaler  New size: 6; reason: cpu resource utilization (percentage of request) above target
+  Normal  SuccessfulRescale  2m1s  horizontal-pod-autoscaler  New size: 3; reason: All metrics below target
+  Normal  SuccessfulRescale  106s  horizontal-pod-autoscaler  New size: 2; reason: All metrics below target
+```
+
+**Observaciones técnicas comprobadas en vivo:**
+1. **Escalado rápido hacia arriba y techo `maxReplicas`:** al alcanzar `208 %` sobre 2 réplicas ($\lceil 2 \times 208 / 50 \rceil = 9$), el HPA escaló en 30 segundos (`2 → 4 → 6`) y respetó el tope `maxReplicas: 6` incluso cuando los 3 Pods sobre `/imagen` sostuvieron `120–123 %` de CPU, protegiendo al nodo (las 6 réplicas consumieron `39–41 Mi` c/u sin `OOMKilled` ni Pods `Pending`).
+2. **Ventana de estabilización de *scale-down* (300 s) y piso `minReplicas`:** al retirar la carga en el minuto `10m` (`cpu: 2%/50%`), el HPA mantuvo las 6 réplicas durante exactamente **5 minutos** hasta el minuto `15m` para evitar *flapping*, y luego redujo gradualmente (`6 → 3 → 2`), deteniéndose en `minReplicas: 2` (`ScalingLimited: True / TooFewReplicas`) para preservar disponibilidad.
+3. **¿Qué deja de estar garantizado al pasar de 1 réplica de la API a 3 (o 6)?** Deja de estar garantizado cualquier dato guardado en la memoria local o en el sistema de archivos del Pod de `catalogo-api`: el Service balancea cada pedido a una réplica distinta y las réplicas se crean y destruyen dinámicamente. Por eso en `catalogo-app` los productos **y los bytes de sus imágenes** residen en MongoDB (`catalogo-db` + `catalogo-db-pvc`), y la siembra `SEED_DEMO=true` es idempotente (`upsert` con índice único sobre `sku`) para evitar duplicados cuando arrancan múltiples réplicas en paralelo.
+
+### 4 y 5. Chart de Helm `catalogo-app/` (12 objetos exactos) y parametrización efectiva
+Se creó el Chart de Helm en `catalogo-app/` conservando intacta la carpeta `k8s/` del recorrido previo. El chart contiene exactamente los **12 objetos productivos** (excluyendo el Service de depuración `catalogo-api-nodeport` de TP-06 y los Pods sueltos de TP-05):
+- 3 `Deployments` (`catalogo-frontend`, `catalogo-api`, `catalogo-db`)
+- 3 `Services` (`catalogo-frontend` NodePort `30302`, `catalogo-api` y `catalogo-db` ClusterIP)
+- 2 `ConfigMaps` (`catalogo-frontend-config`, `catalogo-api-config`)
+- 1 `Secret` (`catalogo-db-secret`)
+- 1 `PersistentVolumeClaim` (`catalogo-db-pvc`)
+- 1 `Ingress` (`catalogo-app-ingress`, host `catalogo.local → catalogo-frontend:8080`)
+- 1 `HorizontalPodAutoscaler` (`catalogo-api-hpa`)
+
+**Parametrización en `values.yaml` (y prueba anti-parametrización decorativa):**
+Se parametrizaron repositorios y tags de las imágenes propias (`api.image.tag`, `frontend.image.tag`), réplicas, puertos, `resources.requests`/`limits`, umbrales del HPA (`minReplicas`, `maxReplicas`, `targetCPUUtilizationPercentage`), configuración de ambos ConfigMaps, almacenamiento del PVC, host del Ingress y credenciales (con placeholders en `values.yaml` y valores reales en `catalogo-app/values-secret.yaml`, ignorado en `.gitignore`).
+
+Validación de `helm lint`, conteo exacto en orden fijo y verificación de cambio efectivo mediante `--set`:
+```text
+$ helm lint ./catalogo-app -f catalogo-app/values-secret.yaml
+1 chart(s) linted, 0 chart(s) failed
+
+$ helm template catalogo-app ./catalogo-app -n catalogo-app -f catalogo-app/values-secret.yaml | grep '^kind:' | uniq -c
+      1 kind: Secret
+      2 kind: ConfigMap
+      1 kind: PersistentVolumeClaim
+      3 kind: Service
+      3 kind: Deployment
+      1 kind: HorizontalPodAutoscaler
+      1 kind: Ingress
+
+$ helm template catalogo-app ./catalogo-app -n catalogo-app \
+    --set api.image.tag=v99 --set frontend.image.tag=v88 \
+    --set api.replicaCount=5 --set hpa.maxReplicas=9 \
+    | grep -E '(image:|replicas:|maxReplicas:)'
+  replicas: 5
+          image: "jmfloress04/catalogo-api:v99"
+  replicas: 1
+          image: "mongo:7"
+  replicas: 2
+          image: "jmfloress04/catalogo-frontend:v88"
+  maxReplicas: 9
+```
+
+- **Orden fijo por tipo de objeto:** Helm aplica `Secret → ConfigMap → PVC → Service → Deployment → HPA → Ingress`. Al crear los `Services` antes que los `Deployments`, desaparece automáticamente el error `host not found in upstream` observado en la Semana 6 cuando Nginx arrancaba antes de existir el DNS `catalogo-api`.
+- **Decisión de conexión a MongoDB (Variante C):** se sostiene el modelo de **piezas separadas** (`DB_HOST`, `DB_PORT`, `DB_NAME` en `catalogo-api-config` + `MONGO_INITDB_ROOT_USERNAME` / `MONGO_INITDB_ROOT_PASSWORD` en `catalogo-db-secret`, renombradas a `DB_USER` / `DB_PASSWORD` vía `valueFrom.secretKeyRef`). Así existe una única fuente de verdad para la contraseña, no se duplica ni se mezcla con configuración pública, y `backend/main.py` agrega `?authSource=admin` automáticamente (evitando el fallo `Authentication failed` que ocurre al componer una `MONGO_URI` incompleta o partida entre ConfigMap y Secret).
+
+### 6. Instalación limpia de la Release con `helm install --create-namespace`
+Para evitar colisión con los manifiestos aplicados manualmente en TP-05..TP-07, se eliminó el namespace previo (`kubectl delete namespace catalogo-app`) y se instalaron los 12 objetos en un único comando:
+
+```bash
+helm install catalogo-app ./catalogo-app \
+  -n catalogo-app --create-namespace \
+  -f catalogo-app/values-secret.yaml
+```
+
+Verificación completa de los 12 objetos del proyecto (`kubectl get all,cm,secret,pvc,ingress,hpa -n catalogo-app`):
+```text
+NAME                                     READY   STATUS    RESTARTS   AGE
+pod/catalogo-api-5d9495fb65-7snn2        1/1     Running   0          47s
+pod/catalogo-api-5d9495fb65-w8j85        1/1     Running   0          47s
+pod/catalogo-db-558886cdd5-5grxx         1/1     Running   0          47s
+pod/catalogo-frontend-5c4996b696-5bwd5   1/1     Running   0          47s
+pod/catalogo-frontend-5c4996b696-hr8xm   1/1     Running   0          47s
+
+NAME                        TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)          AGE
+service/catalogo-api        ClusterIP   10.99.95.19      <none>        8000/TCP         47s
+service/catalogo-db         ClusterIP   10.105.193.192   <none>        27017/TCP        47s
+service/catalogo-frontend   NodePort    10.97.129.4      <none>        8080:30302/TCP   47s
+
+NAME                                READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/catalogo-api        2/2     2            2           47s
+deployment.apps/catalogo-db         1/1     1            1           47s
+deployment.apps/catalogo-frontend   2/2     2            2           47s
+
+NAME                                                   REFERENCE                 TARGETS       MINPODS   MAXPODS   REPLICAS   AGE
+horizontalpodautoscaler.autoscaling/catalogo-api-hpa   Deployment/catalogo-api   cpu: 3%/50%   2         6         2          47s
+
+NAME                                 DATA   AGE
+configmap/catalogo-api-config        5      47s
+configmap/catalogo-frontend-config   2      47s
+configmap/kube-root-ca.crt           1      47s
+
+NAME                                        TYPE                 DATA   AGE
+secret/catalogo-db-secret                   Opaque               2      48s
+secret/sh.helm.release.v1.catalogo-app.v1   helm.sh/release.v1   1      48s
+
+NAME                                    STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+persistentvolumeclaim/catalogo-db-pvc   Bound    pvc-1f72bfb7-2242-40aa-829f-a93f1cfa398d   1Gi        RWO            local-path     48s
+
+NAME                                             CLASS   HOSTS            ADDRESS         PORTS   AGE
+ingress.networking.k8s.io/catalogo-app-ingress   nginx   catalogo.local   172.16.21.209   80      48s
+```
+*(Además de los 12 objetos del proyecto, aparecen los recursos automáticos del clúster/Helm: `configmap/kube-root-ca.crt` y `secret/sh.helm.release.v1.catalogo-app.v1`, donde Helm almacena el estado de la revisión 1.)*
+
+Verificación funcional detrás del Ingress:
+- `helm list -n catalogo-app` → `REVISION: 1`, `STATUS: deployed`, `CHART: catalogo-app-0.1.0`, `APP VERSION: v1`.
+- `http://catalogo.local/api/productos` → `HTTP/1.1 200 OK`, `Content-Type: application/json`.
+- `http://catalogo.local/api/docs` → `url: '/api/openapi.json'` (confirma `ROOT_PATH="/api"` desde `catalogo-api-config`).
+- `kubectl get hpa -n catalogo-app` → `cpu: 2%/50%` (sin `<unknown>`, `0` reinicios en todos los Pods).
+
+### 7. Ciclo completo de Release: `helm upgrade` (`v2`), `helm history` y `helm rollback` (`v1`)
+Se ejecutó el ciclo completo de actualización y reversión sobre la release `catalogo-app` pasando `-f catalogo-app/values-secret.yaml` (ya que `helm upgrade` no hereda overrides previos salvo que se repitan o se use `--reuse-values`):
+
+1. **`helm upgrade` modificando solo el tag de la API a `v2` (Revisión `2`):**
+   ```bash
+   helm upgrade catalogo-app ./catalogo-app \
+     -n catalogo-app \
+     -f catalogo-app/values-secret.yaml \
+     --set api.image.tag=v2
+   ```
+   Imágenes desplegadas tras el `upgrade`:
+   ```text
+   NAME                IMAGE
+   catalogo-api        jmfloress04/catalogo-api:v2
+   catalogo-db         mongo:7
+   catalogo-frontend   jmfloress04/catalogo-frontend:v1
+   ```
+   - **Observación obligatoria (ciclos de vida independientes):** modificar `api.image.tag` de `v1` a `v2` **no modifica el tag de `catalogo-frontend`** (que permanece en `v1`), porque backend y frontend son dos imágenes independientes con ciclos de despliegue independientes.
+
+2. **`helm rollback catalogo-app 1 -n catalogo-app` y consulta de historial (`helm history`):**
+   ```text
+   REVISION  UPDATED                   STATUS      CHART               APP VERSION  DESCRIPTION
+   1         Mon Nov 23 19:35:19 2026  superseded  catalogo-app-0.1.0  v1           Install complete
+   2         Mon Nov 23 19:41:02 2026  superseded  catalogo-app-0.1.0  v1           Upgrade complete
+   3         Mon Nov 23 19:42:40 2026  deployed    catalogo-app-0.1.0  v1           Rollback to 1
+   ```
+   - El rollback **no borra la revisión `2`**: crea la **revisión `3`** con el estado completo de la `1` (análogo a `git revert`), devolviendo `catalogo-api` a `jmfloress04/catalogo-api:v1` y revirtiendo los 12 objetos como una única unidad (confirmado en el indicador de versión del navegador: `v1 → v2 → v1`).
