@@ -1,3 +1,70 @@
+# Catálogo App
+
+## Índice
+
+- **[Etapa 1 — Arquitectura](#etapa-1--arquitectura)**
+- **[Etapa 2 — Medición y Optimización de Imágenes](#etapa-2--medición-y-optimización-de-imágenes)**
+  - [Qué aportó cada decisión](#qué-aportó-cada-decisión)
+  - [Análisis de capas (`docker history`)](#análisis-de-capas-docker-history)
+  - [Efecto del cache de construcción](#efecto-del-cache-de-construcción)
+- **[Etapa 3 — Redes y Almacenamiento](#etapa-3--redes-y-almacenamiento)**
+  - [Red y volumen](#red-y-volumen)
+  - [Base de datos (`catalogo-db`)](#base-de-datos-catalogo-db)
+  - [API (`catalogo-api`) y resolución DNS interna](#api-catalogo-api-y-resolución-dns-interna)
+  - [Diagnóstico de fallas: resolución de nombre vs. autenticación](#diagnóstico-de-fallas-resolución-de-nombre-vs-autenticación)
+  - [Fallo del frontend fuera de la red (`catalogo-frontend`)](#fallo-del-frontend-fuera-de-la-red-catalogo-frontend)
+  - [Frontend conectado a `catalogo-net` y verificación del reverse proxy](#frontend-conectado-a-catalogo-net-y-verificación-del-reverse-proxy)
+  - [Verificación del proxy y efecto de `ROOT_PATH` en FastAPI](#verificación-del-proxy-y-efecto-de-root_path-en-fastapi)
+  - [Persistencia de datos en MongoDB (`catalogo-db-data`)](#persistencia-de-datos-en-mongodb-catalogo-db-data)
+  - [Orden de arranque manual](#orden-de-arranque-manual)
+- **[Etapa 4 — Docker Compose y Seguridad Básica](#etapa-4--docker-compose-y-seguridad-básica)**
+  - [Healthcheck de `catalogo-db` (MongoDB 7)](#healthcheck-de-catalogo-db-mongodb-7)
+  - [Healthcheck de `catalogo-api` (FastAPI)](#healthcheck-de-catalogo-api-fastapi)
+  - [Healthcheck de `catalogo-frontend` (Nginx Alpine)](#healthcheck-de-catalogo-frontend-nginx-alpine)
+  - [Orden de arranque y dependencias (`depends_on` con `condition: service_healthy`)](#orden-de-arranque-y-dependencias-depends_on-con-condition-service_healthy)
+  - [Verificación de persistencia tras bajar y volver a levantar el stack](#verificación-de-persistencia-tras-bajar-y-volver-a-levantar-el-stack)
+  - [Idempotencia de la siembra de datos](#idempotencia-de-la-siembra-de-datos)
+  - [Revisión de seguridad y escaneo de vulnerabilidades (Trivy)](#revisión-de-seguridad-y-escaneo-de-vulnerabilidades-trivy)
+  - [Principio de mínimo privilegio (`cap_drop` / `cap_add`)](#principio-de-mínimo-privilegio-cap_drop--cap_add)
+  - [Comparativa: `docker run` manuales vs. `docker-compose.yml`](#comparativa-docker-run-manuales-vs-docker-composeyml)
+- **[Etapa 5 — Primer despliegue en Kubernetes (Pods sueltos)](#etapa-5--primer-despliegue-en-kubernetes-pods-sueltos)**
+  - [Contexto del clúster (verificación previa)](#contexto-del-clúster-verificación-previa)
+  - [1. Prueba de `ImagePullBackOff`](#1-prueba-de-imagepullbackoff)
+  - [2. Creación del namespace `catalogo-app` y configuración del contexto](#2-creación-del-namespace-catalogo-app-y-configuración-del-contexto)
+  - [3. Generación del primer manifiesto (`k8s/pod-catalogo-db.yaml`) con `--dry-run=client`](#3-generación-del-primer-manifiesto-k8spod-catalogo-dbyaml-con---dry-runclient)
+  - [4. Despliegue de las tres capas como Pods sueltos y registro de IPs](#4-despliegue-de-las-tres-capas-como-pods-sueltos-y-registro-de-ips)
+  - [5. Diagnóstico del `CrashLoopBackOff` de `catalogo-api`](#5-diagnóstico-del-crashloopbackoff-de-catalogo-api)
+  - [6. Conexión temporal por IP y por qué la IP de un Pod es descartable](#6-conexión-temporal-por-ip-y-por-qué-la-ip-de-un-pod-es-descartable)
+  - [7. Tercer `host not found in upstream` en `catalogo-frontend`](#7-tercer-host-not-found-in-upstream-en-catalogo-frontend)
+  - [8. Acceso temporal sin `Service` mediante `kubectl port-forward`](#8-acceso-temporal-sin-service-mediante-kubectl-port-forward)
+  - [9. Mortalidad de los Pods sueltos](#9-mortalidad-de-los-pods-sueltos)
+  - [10. Cheatsheet propio de `kubectl` (Consigna 10)](#10-cheatsheet-propio-de-kubectl-consigna-10)
+  - [11. Comparación: `docker-compose.yml` vs. manifiestos `k8s/`](#11-comparación-docker-composeyml-vs-manifiestos-k8s)
+- **[Etapa 6 — Deployments, Services, Rolling Updates y Réplicas sin Estado](#etapa-6--deployments-services-rolling-updates-y-réplicas-sin-estado)**
+  - [Orden de aplicación (Services antes que Deployments)](#orden-de-aplicación-services-antes-que-deployments)
+  - [Verificación de selectors mediante Endpoints](#verificación-de-selectors-mediante-endpoints)
+  - [Comprobación de autorreparación](#comprobación-de-autorreparación)
+  - [Actualización progresiva (`RollingUpdate`) y `rollback`](#actualización-progresiva-rollingupdate-y-rollback)
+  - [Escalado a 3 réplicas y por qué la API debe ser sin estado (*stateless*)](#escalado-a-3-réplicas-y-por-qué-la-api-debe-ser-sin-estado-stateless)
+  - [Limitación conocida: `catalogo-db` sin persistencia](#limitación-conocida-catalogo-db-sin-persistencia)
+- **[Etapa 7 — ConfigMaps, Secrets, Almacenamiento e Ingress](#etapa-7--configmaps-secrets-almacenamiento-e-ingress)**
+  - [Secret `catalogo-db-secret` (Base64 no es cifrado)](#secret-catalogo-db-secret-base64-no-es-cifrado)
+  - [Conexión a MongoDB: piezas sueltas vs. `MONGO_URI` completa](#conexión-a-mongodb-piezas-sueltas-vs-mongo_uri-completa)
+  - [Persistencia de MongoDB: `catalogo-db-pvc`](#persistencia-de-mongodb-catalogo-db-pvc)
+  - [Verificación de persistencia y cierre de la limitación](#verificación-de-persistencia-y-cierre-de-la-limitación)
+  - [Exposición HTTP con Ingress: `catalogo-app-ingress`](#exposición-http-con-ingress-catalogo-app-ingress)
+  - [Documentación de la API detrás del Ingress](#documentación-de-la-api-detrás-del-ingress)
+  - [Inventario de los 11 objetos actuales del proyecto](#inventario-de-los-11-objetos-actuales-del-proyecto)
+- **[Etapa 8 — Escalado Automático (HPA) y Empaquetado con Helm](#etapa-8--escalado-automático-hpa-y-empaquetado-con-helm)**
+  - [1. Declaración de `resources.requests` y `limits` en `catalogo-api`](#1-declaración-de-resourcesrequests-y-limits-en-catalogo-api)
+  - [2. Objeto N° 12: Creación del `HorizontalPodAutoscaler` (`catalogo-api-hpa`)](#2-objeto-n-12-creación-del-horizontalpodautoscaler-catalogo-api-hpa)
+  - [3. Demostración bajo carga real (`2 → 4 → 6 → 3 → 2`)](#3-demostración-bajo-carga-real-2--4--6--3--2)
+  - [4 y 5. Chart de Helm `catalogo-app/` (12 objetos exactos) y parametrización efectiva](#4-y-5-chart-de-helm-catalogo-app-12-objetos-exactos-y-parametrización-efectiva)
+  - [6. Instalación limpia de la Release con `helm install --create-namespace`](#6-instalación-limpia-de-la-release-con-helm-install---create-namespace)
+  - [7. Ciclo completo de Release: `helm upgrade` (`v2`), `helm history` y `helm rollback` (`v1`)](#7-ciclo-completo-de-release-helm-upgrade-v2-helm-history-y-helm-rollback-v1)
+
+---
+
 ## Etapa 1 — Arquitectura
 
     navegador ──► catalogo-frontend ──────► catalogo-api ──────► catalogo-db
